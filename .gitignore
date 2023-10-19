@@ -1,0 +1,7 @@
+._internal/*
+venv/*
+spack/*
+spack_envs/*
+logs/*
+byoe.yaml
+!example_conf/byoe.yaml

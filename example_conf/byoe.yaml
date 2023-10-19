@@ -1,0 +1,216 @@
+# For multi-user setups put the base_dir in some shared directory
+base_dir: ~/.byoe
+spack_repo: 
+  url: https://github.com/spack/spack.git
+  branch: develop
+binutils_version: "2.40"
+build_on_slurm: True
+
+# Define spack config globally and for individual environments
+# Spack environments are used as the base layer for our environments
+spack:
+  slurm_opts:
+    enabled: True
+    install:
+      tasks_per_job: 20
+      srun_args: "-t 36:00:00 --mem-per-cpu 3G --gres disk:128 -C ssdscratch"
+      tmp_dir: /mnt/scratch
+    concretize:
+      tasks_per_job: 20
+      srun_args: "-t 12:00:00 --mem-per-cpu 1G"
+  packages:
+    libarchive:
+      variants: compression=bz2lib,lz4,lzo2,lzma,zlib,zstd
+    cairo:
+      variants: +pdf
+    openmpi:
+      variants: schedulers=slurm +pmi fabrics=ucx
+    ucx:
+      variants: +rc +ud +mlx5-dv +thread_multiple
+    all:
+      compiler: [gcc@12.3.0]
+      providers:
+        mpi: [openmpi]
+        blas: [openblas]
+        lapack: [openblas]
+  global_specs:
+    - openblas
+    - openmpi
+    - micromamba
+    - rust
+    - ants
+    - dcmtk
+    - freesurfer
+    - itk
+    - mrtrix3
+    - bart
+    - python@3.10
+    - py-numpy
+    - py-scipy
+    - py-mpi4py
+    - py-dask-mpi
+    - py-dask
+    - py-itk
+    - py-scikit-image
+    - py-scikit-learn
+    - py-scikit-sparse
+    - py-scikit-optimize
+    - py-scikit-fuzzy
+    - py-wxpython
+    - py-pystan
+  envs:
+    default:
+      packages:
+        all:
+          providers:
+            opengl: [osmesa]
+      specs:
+        - libosmesa
+        - vtk@8.1.2+osmesa~mpi~opengl2
+        
+    default_gpu:
+      needs_gpu: True
+      specs:
+        - cuda
+        - vtk
+
+
+# Python virtual environments are built on top of the spack environments and can include
+# the "system" python packages built by spack
+python:
+  global_specs:
+    - catboost
+    - keras
+    - theano
+    - torch
+    - torchvision
+    - monai
+    - tensorflow
+    - matplotlib
+    - pandas
+    - polars
+    - simpleitk
+    - lmfit
+    - pymvpa2
+    - statsmodels
+    - trimesh
+    - rtree
+    - numba
+    - nfft
+    - pymc3
+    - h5py
+    - tables
+    - mpmath
+    - sympy
+    - emcee
+    - patsy
+    - networkx
+    - fpzip
+    - pyzfp
+    - -e git+https://github.com/pyNFFT/pyNFFT#egg=pynfft
+    - zarr
+    - xarray
+    - netCDF4
+    - pint
+    - six
+    - future
+    - colorama
+    - crayons
+    - Pygments
+    - Pillow
+    - click
+    - click-completion
+    - jinja2
+    - jedi
+    - docopt
+    - appdirs
+    - traitlets
+    - decorator
+    - simplegeneric
+    - toolz
+    - moviepy
+    - configobj
+    - gevent
+    - greenlet
+    - msgpack-python
+    - cffi
+    - python-bidi
+    - rich
+    - traits
+    - psutil
+    - virtualenv
+    - virtualenv-clone
+    - pipdeptree
+    - pipfile
+    - twine
+    - packaging
+    - requirements-parser
+    - nose
+    - pytest
+    - pytest-asyncio
+    - pydicom
+    - pynetdicom
+    - nibabel
+    - bruker2nifti
+    - dcmstack
+    - pyxnat
+    - nipy
+    - nipype
+    - nitime
+    - dipy
+    - nilearn
+    - nmrglue
+    - suspect
+    - cfflib
+    - numexpr
+    - reportlab
+    - pyosf
+    - tiledb
+    - blaze
+    - simpledist
+    - PsychoPy
+    - psychopy_ext
+    - seaborn
+    - ggplot
+    - bokeh
+    - pyqtgraph
+    - plotutils
+    - triangle-plot
+    - plotly
+    - dash
+    - ipython
+    - prompt-toolkit
+    - ptpython
+    - jupyter
+
+  envs:
+    default:
+      spack_env: default
+      system_packages: True
+    default_gpu:
+      spack_env: default_gpu
+      system_packages: True
+      specs:
+        - pyopengl
+        - pyglet
+        - vispy
+        - napari
+        - pyvista
+
+
+# Conda packages can be use to supplement the available applications in the environment
+# however the libraries / interpreters are siloed off from the rest of the system
+conda:
+  channels:
+    - conda-forge
+    - hcc
+    - https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/public/
+  envs:
+    default:
+      include: 
+        - https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/releases/fsl-6.0.7_linux-64.yml
+      dependencies:
+        - afni
+      expose_bin:
+        "fsl*": "*"
+        "afni": "*"
