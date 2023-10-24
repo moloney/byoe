@@ -8,9 +8,9 @@ from typing import List, Dict, Optional, Any
 
 import yaml
 import sh
-from sh import CommandNotFound
 
 sh = sh.bake(_tty_out=False)
+git = sh.git
 
 from ._globals import DEFAULT_SLURM_TASKS
 from .util import get_activated_envrion, get_env_cmd, srun_wrap, HAS_SLURM

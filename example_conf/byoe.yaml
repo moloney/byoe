@@ -18,6 +18,8 @@ spack:
     concretize:
       tasks_per_job: 20
       srun_args: "-t 12:00:00 --mem-per-cpu 1G"
+  externals:
+    - slurm
   packages:
     libarchive:
       variants: compression=bz2lib,lz4,lzo2,lzma,zlib,zstd
@@ -36,12 +38,17 @@ spack:
   global_specs:
     - openblas
     - openmpi
+    - fftw
+    - pnfft
+    - qhull
     - micromamba
     - rust
+    - wxwidgets
+    - cairo
     - ants
+    - itk
     - dcmtk
     - freesurfer
-    - itk
     - mrtrix3
     - bart
     - python@3.10
@@ -50,6 +57,7 @@ spack:
     - py-mpi4py
     - py-dask-mpi
     - py-dask
+    - py-pyfftw
     - py-itk
     - py-scikit-image
     - py-scikit-learn
@@ -58,6 +66,11 @@ spack:
     - py-scikit-fuzzy
     - py-wxpython
     - py-pystan
+
+    - r
+    - r-dplyr
+    - r-ggplot
+    - r-tidyverse
   envs:
     default:
       packages:
@@ -65,14 +78,14 @@ spack:
           providers:
             opengl: [osmesa]
       specs:
-        - libosmesa
-        - vtk@8.1.2+osmesa~mpi~opengl2
+        - mesa
+        - vtk+osmesa+python
         
     default_gpu:
       needs_gpu: True
       specs:
         - cuda
-        - vtk
+        - vtk+python
 
 
 # Python virtual environments are built on top of the spack environments and can include

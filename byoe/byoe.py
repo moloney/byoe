@@ -86,11 +86,14 @@ def prep_base_dir(
         if spack_branch:
             kwargs["branch"] = spack_branch
         git.clone(spack_url, spack_dir, **kwargs)
+    else:
+        log.info("Pulling updates into spack repo")
+        git("-C", f"{locs['spack_dir']}", "pull", "-m", "BYOE Auto merge, don't commit!")
     spack_lic_dir = locs["spack_dir"] / "etc" / "spack" / "licenses"
     if not spack_lic_dir.exists():
         spack_lic_dir.symlink_to("../../../licenses", True)
     for sect_name, sect_data in conf_data["spack"].items():
-        if sect_name in ("envs", "global_specs", "slurm_build"):
+        if sect_name in ("envs", "global_specs", "slurm_build", "externals"):
             continue
         conf_path = locs["spack_dir"] / "etc" / "spack" / f"{sect_name}.yaml"
         with open(conf_path, "wt") as conf_f:
@@ -107,6 +110,9 @@ def prep_base_dir(
     )
     log.info("Bootstrapping spack")
     spack.bootstrap.now()
+    log.info("Looking for externals")
+    for external in conf_data["spack"].get("externals", []):
+        spack.external.find(external, scope="site")
     log.info("Checking binutils")
     binutils_vers = conf_data.get("binutils_version", "2.40")
     try:

@@ -67,11 +67,15 @@ def update_venv(
         pip_compile(main_req_path, output_file=str(lock_path), generate_hashes=True)
         log.info("Running pip-sync to build venv: %s", snap_path)
         pip_sync(str(lock_path), pip_args=f"--find-links {wheels_dir}")
-        # TODO: Call "pip wheel" to update wheels dir
     except:
         #if snap_path.exists():
         #    shutil.rmtree(snap_path)
         raise
+    try:
+        log.debug("Updating python wheels dir")
+        pip.wheel(find_links=str(wheels_dir), w=str(wheels_dir), r=str(lock_path))
+    except:
+        log.exception("Error while building wheels")
 
 
 def update_all_venvs(
@@ -86,6 +90,8 @@ def update_all_venvs(
     py_info = conf.get("python")
     if not py_info:
         return
+    wheels_dir = path_locs["wheels_dir"]
+    wheels_dir.mkdir(parents=True, exist_ok=True)
     for env_name, env_info in py_info.get("envs", {}).items():
         env_info = deepcopy(env_info)
         if "specs" in env_info:
