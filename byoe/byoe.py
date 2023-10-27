@@ -27,7 +27,7 @@ from .conda import update_all_conda_envs
 log = logging.getLogger(__name__)
 
 
-class UpdateChannels(Enum):
+class UpdateChannel(Enum):
     BLOODY = "bloody"
     FRESH = "fresh"
     STABLE = "stable"
@@ -36,11 +36,11 @@ class UpdateChannels(Enum):
 
 
 DEFUALT_UPDATE_MONTHS = {
-    UpdateChannels.BLOODY: 1,
-    UpdateChannels.FRESH: 3,
-    UpdateChannels.STABLE: 6,
-    UpdateChannels.STALE: 12,
-    UpdateChannels.OLD: 24,
+    UpdateChannel.BLOODY: 1,
+    UpdateChannel.FRESH: 3,
+    UpdateChannel.STABLE: 6,
+    UpdateChannel.STALE: 12,
+    UpdateChannel.OLD: 24,
 }
 
 
@@ -88,7 +88,7 @@ def prep_base_dir(
         git.clone(spack_url, spack_dir, **kwargs)
     else:
         log.info("Pulling updates into spack repo")
-        git("-C", f"{locs['spack_dir']}", "pull", "-m", "BYOE Auto merge, don't commit!")
+        git("--git-dir", f"{locs['spack_dir'] / '.git'}", "pull", "--no-commit")
     spack_lic_dir = locs["spack_dir"] / "etc" / "spack" / "licenses"
     if not spack_lic_dir.exists():
         spack_lic_dir.symlink_to("../../../licenses", True)

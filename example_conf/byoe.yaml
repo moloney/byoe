@@ -3,7 +3,7 @@ base_dir: ~/.byoe
 spack_repo: 
   url: https://github.com/spack/spack.git
   branch: develop
-binutils_version: "2.40"
+binutils_version: "2.41"
 build_on_slurm: True
 
 # Define spack config globally and for individual environments
@@ -16,8 +16,8 @@ spack:
       srun_args: "-t 36:00:00 --mem-per-cpu 3G --gres disk:128 -C ssdscratch"
       tmp_dir: /mnt/scratch
     concretize:
-      tasks_per_job: 20
-      srun_args: "-t 12:00:00 --mem-per-cpu 1G"
+      tasks_per_job: 8
+      srun_args: "-t 4:00:00 --mem-per-cpu 2G"
   externals:
     - slurm
   packages:
@@ -27,10 +27,14 @@ spack:
       variants: +pdf
     openmpi:
       variants: schedulers=slurm +pmi fabrics=ucx
+    mpich:
+      variants: +slurm
     ucx:
       variants: +rc +ud +mlx5-dv +thread_multiple
     all:
       compiler: [gcc@12.3.0]
+      target: [ivybridge]
+      require: target=ivybridge
       providers:
         mpi: [openmpi]
         blas: [openblas]
@@ -66,7 +70,6 @@ spack:
     - py-scikit-fuzzy
     - py-wxpython
     - py-pystan
-
     - r
     - r-dplyr
     - r-ggplot
@@ -80,12 +83,6 @@ spack:
       specs:
         - mesa
         - vtk+osmesa+python
-        
-    default_gpu:
-      needs_gpu: True
-      specs:
-        - cuda
-        - vtk+python
 
 
 # Python virtual environments are built on top of the spack environments and can include
@@ -200,15 +197,6 @@ python:
     default:
       spack_env: default
       system_packages: True
-    default_gpu:
-      spack_env: default_gpu
-      system_packages: True
-      specs:
-        - pyopengl
-        - pyglet
-        - vispy
-        - napari
-        - pyvista
 
 
 # Conda packages can be use to supplement the available applications in the environment

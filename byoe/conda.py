@@ -3,8 +3,10 @@ from pathlib import Path
 from copy import deepcopy
 from typing import Dict, Any
 
+import yaml
 import sh
 from sh import CommandNotFound
+
 sh = sh.bake(_tty_out=False)
 try:
     srun = sh.srun
@@ -25,21 +27,35 @@ def get_micromamba(path_locs: Dict[str, Path]):
     return micromamba
 
 
-def update_conda_env(conda_cmd: sh.Command, snap_path: Path, env_info):
+def update_conda_env(conda_cmd: sh.Command, snap_name: str, env_info):
     """Create updated snapshot of a conda environment"""
-    conda_cmd.create()
+    conda_cmd.create(name=snap_name)
     # TODO
 
 
 def update_all_conda_envs(
-    update_ts: str, 
-    conf_data: dict[str, Any], 
-    path_locs: Dict[str, Path], 
+    update_ts: str,
+    conf_data: dict[str, Any],
+    path_locs: Dict[str, Path],
 ):
     conda_info = conf_data.get("conda", {})
     if not conda_info:
         return
+    path_locs["conda_pkg_dir"].mkdir(exist_ok=True)
+    path_locs["conda_env_dir"].mkdir(exist_ok=True)
+    conda_conf = path_locs["conda_dir"] / "condarc"
+    conda_conf.write_text(
+        yaml.dump(
+            {
+                "channels": conda_info["channels"],
+                "pkg_dirs": [path_locs["conda_pkg_dir"]],
+            }
+        )
+    )
+    conda_cmd = get_micromamba(path_locs).bake(
+        rc_file=str(conda_conf), root_prefix=path_locs["conda_dir"]
+    )
     for env_name, env_info in conda_info.get("envs", {}).items():
         env_info = deepcopy(env_info)
         snap_name = f"{env_name}-{update_ts}"
-        pass # TODO
+        update_conda_env(conda_cmd, snap_name, env_info)

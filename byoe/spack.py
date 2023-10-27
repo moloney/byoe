@@ -71,7 +71,7 @@ def get_spack(
 
 def get_spack_install(
     spack: sh.Command,
-    fresh: bool = True,
+    fresh: bool = False,
     n_tasks: Optional[int] = None,
     use_slurm: bool = True,
     slurm_opts: Optional[Dict] = None,
@@ -101,7 +101,7 @@ def get_spack_install(
 
 def get_spack_concretize(
     spack: sh.Command,
-    fresh: bool = True,
+    fresh: bool = False,
     n_tasks: Optional[int] = None,
     use_slurm: bool = True,
     slurm_opts: Optional[Dict] = None,
@@ -163,8 +163,13 @@ def _update_spack_env(
     if not conc_out.strip():
         log.info("No updates for spack snapshot: %s", snap_path)
     log.info("Building spack snapshot: %s", snap_path)
-    spack_install([])
-    # time.sleep(90)
+    try:
+        spack_install([])
+    except:
+        log.exception("Error building spack snapshot: %s", snap_path)
+        if snap_path.exists():
+            shutil.rmtree(snap_path)
+        raise
     for sh_type in ("sh", "csh", "fish"):
         act_script = spack.env.activate(f"--{sh_type}", dir=str(env_dir))
         with open(f"{snap_path}_activate.{sh_type}", "wt") as out_f:
@@ -228,10 +233,14 @@ def update_spack_envs(
             use_slurm=use_slurm,
             slurm_opts=slurm_opts.get("concretize", {}),
         )
-        _update_spack_env(env_dir, snap_path, spack, spack_install, spack_concretize)
-        conv_view_links(snap_path)
-        shutil.copy(env_dir / "spack.lock", locs["spack_env_dir"] / f"{snap_name}.lock")
-        created[env_name] = snap_path
+        try:
+            _update_spack_env(env_dir, snap_path, spack, spack_install, spack_concretize)
+        except:
+            pass
+        else:
+            conv_view_links(snap_path)
+            shutil.copy(env_dir / "spack.lock", locs["spack_env_dir"] / f"{snap_name}.lock")
+            created[env_name] = snap_path
     return created
 
 

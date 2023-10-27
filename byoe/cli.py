@@ -8,6 +8,7 @@ from rich.console import Console
 
 from .byoe import (
     DEFAULT_CONF_PATHS,
+    UpdateChannel,
     get_config,
     NoCompilerFoundError,
     prep_base_dir,
@@ -110,5 +111,11 @@ def update_envs(
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
-    
 
+
+@cli.command()
+def activate(
+    name: Optional[str] = None,
+    channel: Optional[UpdateChannel] = None,
+):
+    """Activate an environment"""

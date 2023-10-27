@@ -68,8 +68,8 @@ def update_venv(
         log.info("Running pip-sync to build venv: %s", snap_path)
         pip_sync(str(lock_path), pip_args=f"--find-links {wheels_dir}")
     except:
-        #if snap_path.exists():
-        #    shutil.rmtree(snap_path)
+        if snap_path.exists():
+            shutil.rmtree(snap_path)
         raise
     try:
         log.debug("Updating python wheels dir")
