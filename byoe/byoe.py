@@ -112,7 +112,12 @@ def prep_base_dir(
     spack.bootstrap.now()
     log.info("Looking for externals")
     for external in conf_data["spack"].get("externals", []):
-        spack.external.find(external, scope="site")
+        spack.external.find("--scope", "site", external)
+    log.info("Checking compilers")
+    spack.compiler.find(scope="site")
+    compilers = [x.strip() for x in spack.compiler.list().split("\n")[2:] if x]
+    if len(compilers) == 0:
+        raise NoCompilerFoundError()
     log.info("Checking binutils")
     binutils_vers = conf_data.get("binutils_version", "2.40")
     try:
@@ -122,11 +127,6 @@ def prep_base_dir(
         spack_install([f"binutils@{binutils_vers}", "+ld"])
         binutils_loc = spack.location(first=True, i=f"binutils@{binutils_vers}")
     binutils_loc = Path(binutils_loc.strip())
-    log.info("Checking compilers")
-    spack.compiler.find(scope="site")
-    compilers = [x.strip() for x in spack.compiler.list().split("\n")[2:] if x]
-    if len(compilers) == 0:
-        raise NoCompilerFoundError()
     # Install compilers as needed, configuring them to use our updated binutils
     needed_compilers = []
     for comp in (
@@ -142,7 +142,7 @@ def prep_base_dir(
             log.info("Installing compiler: %s", comp)
             spack_install([comp])
             spack.compiler.find(
-                spack.location(first=True, i=comp).strip(), scope="site"
+                "--scope", "site", spack.location(first=True, i=comp).strip()
             )
         update_compiler_conf(
             spack_dir / "etc" / "spack" / "compilers.yaml", binutils_loc

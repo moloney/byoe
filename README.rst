@@ -38,4 +38,4 @@ Not Using System Python
 
 If you don't have or don't want to use a system python install you can clone this 
 repo and run ``./bootstrap-no-sys-python.sh`` from the root directory of the repo. 
-This will create a virtual environment at ``./venv`` with this package installed.
+This will create a virtual environment at ``./byoe_venv`` with this package installed.
