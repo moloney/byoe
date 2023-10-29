@@ -88,7 +88,7 @@ def prep_base_dir(
         git.clone(spack_url, spack_dir, **kwargs)
     else:
         log.info("Pulling updates into spack repo")
-        git("--git-dir", f"{locs['spack_dir'] / '.git'}", "pull", "--no-commit")
+        git("--git-dir", f"{locs['spack_dir'] / '.git'}", "pull", "--no-edit")
     spack_lic_dir = locs["spack_dir"] / "etc" / "spack" / "licenses"
     if not spack_lic_dir.exists():
         spack_lic_dir.symlink_to("../../../licenses", True)
