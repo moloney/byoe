@@ -124,7 +124,7 @@ def prep_base_dir(
         binutils_loc = spack.location(first=True, i=f"binutils@{binutils_vers}")
     except sh.ErrorReturnCode:
         log.info("Updating binutils")
-        spack_install([f"binutils@{binutils_vers}", "+ld"])
+        spack_install([f"binutils@{binutils_vers}", "+ld", "+gas"])
         binutils_loc = spack.location(first=True, i=f"binutils@{binutils_vers}")
     binutils_loc = Path(binutils_loc.strip())
     # Install compilers as needed, configuring them to use our updated binutils
