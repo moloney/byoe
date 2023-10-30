@@ -45,11 +45,14 @@ Building Environments
 
 You will need a configuration file, the ``example_conf`` directory provides an example.
 If you are building centralized environments for multiple users, configure the 
-``base_dir`` to point to a shared directory.
+``base_dir`` to point to a shared directory. If you have a Slurm cluster you wish to use 
+to compile software, you should configure it now.
 
 You can run the ``init-dir`` subcommand to prepare the defined ``base_dir``, which is 
-useful if you need to prepopulate the contained ``licesnes`` directory with any 
-software licenses you need to build your environments.
+useful if you need to prepopulate the contained ``licenses`` directory with any 
+software licenses you need to build your environments. This will also install updated
+binutils, compiler, and micromamba through spack, so it may take some time to complete
+on the first run.
 
 Running the ``update-envs`` command will build updated versions of all the defined 
 environments. This can take a long time, especially on the first run, so check the

@@ -234,12 +234,16 @@ def update_spack_envs(
             slurm_opts=slurm_opts.get("concretize", {}),
         )
         try:
-            _update_spack_env(env_dir, snap_path, spack, spack_install, spack_concretize)
+            _update_spack_env(
+                env_dir, snap_path, spack, spack_install, spack_concretize
+            )
         except:
             pass
         else:
             conv_view_links(snap_path)
-            shutil.copy(env_dir / "spack.lock", locs["spack_env_dir"] / f"{snap_name}.lock")
+            shutil.copy(
+                env_dir / "spack.lock", locs["spack_env_dir"] / f"{snap_name}.lock"
+            )
             created[env_name] = snap_path
     return created
 
