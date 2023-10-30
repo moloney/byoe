@@ -59,7 +59,7 @@ def get_config(conf_paths: Optional[List[Path]] = None) -> Dict[str, Any]:
         except:
             log.exception("Exception trying to read config: %s", p)
             continue
-    res["base_dir"] = Path(res["base_dir"])
+    res["base_dir"] = Path(res["base_dir"]).expanduser()
     return res
 
 
