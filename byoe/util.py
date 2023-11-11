@@ -24,6 +24,7 @@ def get_locations(base_dir: Path) -> Dict[str, Path]:
     """Get paths to key locations under base_dir"""
     return {
         "base_dir": base_dir,
+        "startup_dir": base_dir / "startup",
         "log_dir": base_dir / "logs",
         "tmp_dir": base_dir / "tmp",
         "lic_dir": base_dir / "licenses",
@@ -92,20 +93,30 @@ def get_env_cmd(
     return getattr(sh, cmd_path).bake(_env=env)
 
 
+def wrap_cmd(
+    wrapper_cmd: sh.Command,
+    inner_cmd: sh.Command,
+    inject_env: Optional[Dict[str, str]] = None,
+) -> sh.Command:
+    """Call ``wrapper_cmd`` with ``inner_cmd`` as the final arguments"""
+    args = [inner_cmd._path] + inner_cmd._partial_baked_args
+    sh_kwargs = {}
+    for kw, val in inner_cmd._partial_call_args.items():
+        sh_kwargs[f"_{kw}"] = val if not hasattr(val, "copy") else val.copy()
+    if inject_env:
+        if "_env" not in sh_kwargs:
+            sh_kwargs["_env"] = os.environ.copy()
+        sh_kwargs["_env"].update(inject_env)
+    return wrapper_cmd.bake(args, **sh_kwargs)
+
+
 def srun_wrap(
     cmd: sh.Command,
     n_cpus: int = 1,
     base_args: str = "",
     tmp_dir: Optional[str] = None,
-):
+) -> sh.Command:
     """Wrap existing sh.Command to run on slurm with 'srun'"""
-    args = shlex.split(base_args) + ["--cpus-per-task=%s" % n_cpus]
-    args += [cmd._path] + cmd._partial_baked_args
-    sh_kwargs = {}
-    for kw, val in cmd._partial_call_args.items():
-        sh_kwargs[f"_{kw}"] = val if not hasattr(val, "copy") else val.copy()
-    if tmp_dir:
-        if "_env" not in sh_kwargs:
-            sh_kwargs["_env"] = os.environ.copy()
-        sh_kwargs["_env"]["TMPDIR"] = tmp_dir
-    return srun.bake(args, **sh_kwargs)
+    srun_args = shlex.split(base_args) + ["--cpus-per-task=%s" % n_cpus]
+    inject_env = None if tmp_dir is None else  {"TMPDIR": tmp_dir}
+    return wrap_cmd(srun.bake(srun_args), cmd, inject_env)

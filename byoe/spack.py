@@ -13,7 +13,7 @@ sh = sh.bake(_tty_out=False)
 git = sh.git
 
 from ._globals import DEFAULT_SLURM_TASKS
-from .util import get_activated_envrion, get_env_cmd, srun_wrap, HAS_SLURM
+from .util import get_activated_envrion, get_env_cmd, srun_wrap, HAS_SLURM, wrap_cmd
 
 
 log = logging.getLogger(__name__)
@@ -69,27 +69,59 @@ def get_spack(
     return spack
 
 
+install_script = """\
+#!/bin/sh
+
+err_out_dir=$1
+spack_cmd=$2
+stage_dir=$(${spack_cmd} location -S)
+${@:2}
+exit_code=$?
+if [ $exit_code -ne 0 ] ; then
+    echo "Copying staging dirs from failed builds to $err_out_dir"
+    mkdir $err_out_dir
+    for build_dir in $(ls -d $stage_dir/spack-stage-*) ; do 
+        cp -r $build_dir $err_out_dir
+    done
+fi
+exit $exit_code
+"""
+
+
 def get_spack_install(
     spack: sh.Command,
+    base_tmp: Path,
+    timestamp: str = None,
     fresh: bool = False,
     n_tasks: Optional[int] = None,
     use_slurm: bool = True,
     slurm_opts: Optional[Dict] = None,
 ) -> sh.Command:
     """Get a preconfigured 'spack install' command"""
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    install_script_path = base_tmp / f"spack_install-{timestamp}.sh"
+    install_script_path.touch(0o770)
+    install_script_path.write_text(install_script)
+    install_cmd = sh.Command(str(install_script_path))
+    install_cmd = install_cmd.bake(base_tmp / f"error-stage-dirs-{timestamp}")
     install_args = []
     if fresh:
         install_args.append("--fresh")
-    if HAS_SLURM and use_slurm:
+    slurm_cpus = os.environ.get("SLURM_CPUS_ON_NODE")
+    if n_tasks:
+        install_args += ["-j", n_tasks]
+    elif slurm_cpus:
+        install_args += ["-j", slurm_cpus]
+    elif HAS_SLURM and use_slurm:
         if slurm_opts is None:
             slurm_opts = {}
         if n_tasks is None:
             n_tasks = slurm_opts.get("tasks_per_job", DEFAULT_SLURM_TASKS)
         install_args.append(f"-j {n_tasks}")
-    elif n_tasks:
-        install_args += ["-j", n_tasks]
-    spack_install = spack.install.bake(*install_args)
-    if HAS_SLURM and use_slurm:
+    
+    spack_install = wrap_cmd(install_cmd, spack.install.bake(*install_args))
+    if HAS_SLURM and use_slurm and not slurm_cpus:
         spack_install = srun_wrap(
             spack_install,
             n_tasks,
@@ -110,16 +142,19 @@ def get_spack_concretize(
     conc_args = []
     if fresh:
         conc_args.append("--fresh")
-    if HAS_SLURM and use_slurm:
+    slurm_cpus = os.environ.get("SLURM_CPUS_ON_NODE")
+    if n_tasks:
+        conc_args += ["-j", n_tasks]
+    elif slurm_cpus:
+        conc_args += ["-j", slurm_cpus]
+    elif HAS_SLURM and use_slurm:
         if slurm_opts is None:
             slurm_opts = {}
         if n_tasks is None:
             n_tasks = slurm_opts.get("tasks_per_job", DEFAULT_SLURM_TASKS)
         conc_args.append(f"-j {n_tasks}")
-    elif n_tasks:
-        install_args += ["-j", n_tasks]
     spack_concretize = spack.concretize.bake(*conc_args)
-    if HAS_SLURM and use_slurm:
+    if HAS_SLURM and use_slurm and not slurm_cpus:
         spack_concretize = srun_wrap(
             spack_concretize,
             n_tasks,
@@ -223,6 +258,8 @@ def update_spack_envs(
         use_slurm = use_slurm and slurm_opts.get("enabled", True)
         spack_install = get_spack_install(
             spack_env,
+            locs["tmp_dir"],
+            update_ts,
             n_tasks=n_tasks,
             use_slurm=use_slurm,
             slurm_opts=slurm_opts.get("install", {}),
@@ -238,7 +275,7 @@ def update_spack_envs(
                 env_dir, snap_path, spack, spack_install, spack_concretize
             )
         except:
-            pass
+            log.error("Error building spack environment: %s", env_dir)
         else:
             conv_view_links(snap_path)
             shutil.copy(

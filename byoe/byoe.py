@@ -1,5 +1,5 @@
 """Bring Your Own Environment"""
-import logging
+import sys, os, logging
 from io import TextIOWrapper
 from enum import Enum
 from pathlib import Path
@@ -71,12 +71,28 @@ def prep_base_dir(
     conf_data: Dict[str, Any],
     n_tasks: Optional[int] = None,
     log_file: Optional[TextIOWrapper] = None,
-):
+) -> None:
     """Make sure base_dir / spack / mamba are available and configured"""
     locs = get_locations(conf_data["base_dir"])
+    locs["startup_dir"].mkdir(exist_ok=True)
     locs["log_dir"].mkdir(exist_ok=True)
     locs["lic_dir"].mkdir(exist_ok=True)
     locs["tmp_dir"].mkdir(exist_ok=True)
+    # Build startup scripts
+    for shell_type in ("sh",):
+        startup_lines = [f"export PATH={Path(sys.argv[0]).parent}:$PATH"]
+        if "python" in conf_data:
+            startup_lines.append(
+                f"export PIP_FIND_LINKS={' '.join([str(locs['wheels_dir'])] + os.environ.get('PIP_FIND_LINKS', []))}"
+            )
+        if "conda" in conf_data:
+            # TODO: Documentation is poor, but seems CONDA_PKG_DIRS doesn't support 
+            #       multiple paths?
+            startup_lines.append(
+                f"export CONDA_PKG_DIRS={locs['conda_pkg_dir']}"
+            )
+        (locs["startup_dir"] / f"byoe_startup.{shell_type}").write_text("\n".join(startup_lines + [""]))
+    # Build / update spack install
     spack_dir = locs["spack_dir"]
     spack_url = conf_data["spack_repo"]["url"]
     spack_branch = conf_data["spack_repo"].get("branch")
@@ -104,6 +120,7 @@ def prep_base_dir(
     use_slurm = use_slurm and slurm_opts.get("enabled", True)
     spack_install = get_spack_install(
         spack,
+        locs["tmp_dir"],
         n_tasks=n_tasks,
         use_slurm=use_slurm,
         slurm_opts=slurm_opts.get("install", {}),
