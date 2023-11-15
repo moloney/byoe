@@ -1,4 +1,4 @@
-import logging
+import sys, logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -6,6 +6,8 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from .util import get_locations
+from .spack import get_spack
 from .byoe import (
     DEFAULT_CONF_PATHS,
     UpdateChannel,
@@ -111,6 +113,20 @@ def update_envs(
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
+
+
+@cli.command(
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
+def spack(ctx: typer.Context):
+    """Forward commands to internal `spack` install, use with caution!
+    
+    Mostly useful for testing package installs.
+    """
+    locs = get_locations(conf_data["base_dir"])
+    # TODO: Need to use stdout / stderr here
+    spack_cmd = get_spack(locs).bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
+    spack_cmd(ctx.args)
 
 
 @cli.command()
