@@ -1,23 +1,27 @@
 import sys, logging
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 import typer
 from rich.console import Console
+import sh
 
+from ._globals import DEFAULT_CONF_PATHS, EnvType, UpdateChannel, ShellType
 from .util import get_locations
 from .spack import get_spack
 from .byoe import (
-    DEFAULT_CONF_PATHS,
-    UpdateChannel,
     get_config,
     NoCompilerFoundError,
     prep_base_dir,
     update_all,
+    get_activate_script,
 )
 
+
 log = logging.getLogger("byoe")
+
 
 error_console = Console(stderr=True, style="bold red")
 
@@ -66,6 +70,9 @@ def init_dir(
 ):
     """Prepare the configured base directory
 
+    This could take a while to run the first time, particularly if we need to build
+    any compilers.
+
     Calling this is optional, mostly useful if you want to prepopulate some sub
     directories (e.g. licenses) before calling 'update_envs'.
     """
@@ -93,8 +100,9 @@ def init_dir(
 def update_envs(
     n_tasks: Optional[int] = None,
     log_path: Optional[Path] = None,
+    pull_spack: bool = True,
 ):
-    """Update environments"""
+    """Update configured environments"""
     if not conf_data:
         error_console.print("Unable to find config")
         return 1
@@ -109,29 +117,62 @@ def update_envs(
     root_logger = logging.getLogger("")
     root_logger.addHandler(file_handler)
     try:
-        update_all(update_ts, conf_data, n_tasks, log_file)
+        update_all(update_ts, conf_data, pull_spack, n_tasks, log_file)
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
 
 
 @cli.command(
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "help_option_names": ["--byoe-help"],
+    }
 )
 def spack(ctx: typer.Context):
-    """Forward commands to internal `spack` install, use with caution!
-    
-    Mostly useful for testing package installs.
+    """Forward commands to internal `spack` command (use `--byoe-help` for details)
+
+    Useful for looking up package info and testing installs of individual packages.
+
+    Administrators must be careful when running commands that mutate state, and
+    generally avoid commands that update configuration.
     """
     locs = get_locations(conf_data["base_dir"])
-    # TODO: Need to use stdout / stderr here
     spack_cmd = get_spack(locs).bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
-    spack_cmd(ctx.args)
+    try:
+        spack_cmd(ctx.args)
+    except sh.ErrorReturnCode:
+        pass
 
 
 @cli.command()
 def activate(
     name: Optional[str] = None,
     channel: Optional[UpdateChannel] = None,
+    time_stamp: Optional[str] = None,
+    skip_layer: Optional[List[EnvType]] = None,
+    shell_type: ShellType = ShellType.SH,
+    tmp: bool = False,
 ):
-    """Activate an environment"""
+    """Produce activation script which can be used with `source \`byoe activate --tmp\``
+
+    To avoid the use of a temp file each time you can do `source <(byoe activate)` in 
+    BASH, or `source (byoe activate | psub)` in FISH. Unfortunately TCSH lacks such 
+    functionality.
+    """
+    # TODO: Raise more specific errors in get_activate_script and convert to error messages here
+    if EnvType.SPACK in skip_layer:
+        if EnvType.PYTHON not in skip_layer:
+            error_console.print(
+                "If skipping 'spack' layer, 'python' must also be skipped"
+            )
+    act_script = get_activate_script(
+        conf_data["base_dir"], name, channel, time_stamp, skip_layer, shell_type
+    )
+    if tmp:
+        tmp_f = NamedTemporaryFile(delete=False)
+        tmp_f.write(act_script)
+        print(tmp_f.name)
+    else:
+        print(act_script)

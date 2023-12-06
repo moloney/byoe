@@ -88,11 +88,49 @@ exit $exit_code
 """
 
 
+def par_spack(
+    cmd: sh.Command,
+    args: Optional[List[str]] = None,
+    n_tasks: Optional[int] = None,
+    use_slurm: bool = True,
+    slurm_opts: Optional[Dict] = None,
+):
+    """Setup spack command to run in parrallel using multiple CPU cores
+    
+    Explicitly passed `n_tasks` takes precedence, otherwise if we are already running in 
+    a Slurm job use the number of allocated CPUs. Finally if Slurm is available and 
+    enabled try to run the command on the Slurm cluster in a new job.
+    """
+    if args:
+        args = args[:]
+    slurm_cpus = os.environ.get("SLURM_CPUS_ON_NODE")
+    if n_tasks:
+        args = ["-j", str(n_tasks)] + args
+    elif slurm_cpus:
+        args = ["-j", slurm_cpus] + args
+    elif HAS_SLURM and use_slurm:
+        if slurm_opts is None:
+            slurm_opts = {}
+        if n_tasks is None:
+            n_tasks = slurm_opts.get("tasks_per_job", DEFAULT_SLURM_TASKS)
+        args = ["-j", str(n_tasks)] + args
+    cmd = cmd.bake(*args)
+    if HAS_SLURM and use_slurm and not slurm_cpus:
+        cmd = srun_wrap(
+            cmd,
+            n_tasks,
+            slurm_opts.get("srun_args", ""),
+            slurm_opts.get("tmp_dir"),
+        )
+    return cmd
+
+
 def get_spack_install(
     spack: sh.Command,
     base_tmp: Path,
     timestamp: str = None,
     fresh: bool = False,
+    yes_to_all: bool = True,
     n_tasks: Optional[int] = None,
     use_slurm: bool = True,
     slurm_opts: Optional[Dict] = None,
@@ -108,27 +146,15 @@ def get_spack_install(
     install_args = []
     if fresh:
         install_args.append("--fresh")
-    slurm_cpus = os.environ.get("SLURM_CPUS_ON_NODE")
-    if n_tasks:
-        install_args += ["-j", n_tasks]
-    elif slurm_cpus:
-        install_args += ["-j", slurm_cpus]
-    elif HAS_SLURM and use_slurm:
-        if slurm_opts is None:
-            slurm_opts = {}
-        if n_tasks is None:
-            n_tasks = slurm_opts.get("tasks_per_job", DEFAULT_SLURM_TASKS)
-        install_args.append(f"-j {n_tasks}")
-    
-    spack_install = wrap_cmd(install_cmd, spack.install.bake(*install_args))
-    if HAS_SLURM and use_slurm and not slurm_cpus:
-        spack_install = srun_wrap(
-            spack_install,
-            n_tasks,
-            slurm_opts.get("srun_args", ""),
-            slurm_opts.get("tmp_dir"),
-        )
-    return spack_install
+    if yes_to_all:
+        install_args.append("--yes-to-all")
+    return par_spack(
+        wrap_cmd(install_cmd, spack.install),
+        install_args,
+        n_tasks,
+        use_slurm,
+        slurm_opts,
+    )
 
 
 def get_spack_concretize(
@@ -142,26 +168,30 @@ def get_spack_concretize(
     conc_args = []
     if fresh:
         conc_args.append("--fresh")
-    slurm_cpus = os.environ.get("SLURM_CPUS_ON_NODE")
-    if n_tasks:
-        conc_args += ["-j", n_tasks]
-    elif slurm_cpus:
-        conc_args += ["-j", slurm_cpus]
-    elif HAS_SLURM and use_slurm:
-        if slurm_opts is None:
-            slurm_opts = {}
-        if n_tasks is None:
-            n_tasks = slurm_opts.get("tasks_per_job", DEFAULT_SLURM_TASKS)
-        conc_args.append(f"-j {n_tasks}")
-    spack_concretize = spack.concretize.bake(*conc_args)
-    if HAS_SLURM and use_slurm and not slurm_cpus:
-        spack_concretize = srun_wrap(
-            spack_concretize,
-            n_tasks,
-            slurm_opts.get("srun_args", ""),
-            slurm_opts.get("tmp_dir"),
-        )
-    return spack_concretize
+    return par_spack(
+        spack.concretize,
+        conc_args,
+        n_tasks,
+        use_slurm,
+        slurm_opts,
+    )
+
+
+def get_spack_push(
+    spack: sh.Command,
+    n_tasks: Optional[int] = None,
+    use_slurm: bool = True,
+    slurm_opts: Optional[Dict] = None,
+):
+    """Get preconfigured 'spack buildcache push' command"""
+    push_args = ["default"]
+    return par_spack(
+        spack.buildcache.push,
+        push_args,
+        n_tasks,
+        use_slurm,
+        slurm_opts,
+    )
 
 
 def conv_view_links(view_dir: Path):
@@ -190,6 +220,7 @@ def _update_spack_env(
     spack: sh.Command,
     spack_install: sh.Command,
     spack_concretize: sh.Command,
+    spack_push: sh.Command,
 ) -> None:
     """Create updated snapshot of a single environment"""
     start = datetime.now()
@@ -198,21 +229,30 @@ def _update_spack_env(
     if not conc_out.strip():
         log.info("No updates for spack snapshot: %s", snap_path)
     log.info("Building spack snapshot: %s", snap_path)
+    install_err: Optional[Exception] = None
     try:
         spack_install([])
-    except:
+    except Exception as e:
+        install_err = e
         log.exception("Error building spack snapshot: %s", snap_path)
         if snap_path.exists():
             shutil.rmtree(snap_path)
-        raise
+    else:
+        log.info(
+            "Finished spack snapshot: %s (took %s)", snap_path, (datetime.now() - start)
+        )
+    log.info("Building spack binary packages")
+    try:
+        spack_push()
+    except:
+        log.exception("Error while pushing to spack buildcache")
+    if install_err is not None:
+        raise install_err
     for sh_type in ("sh", "csh", "fish"):
         act_script = spack.env.activate(f"--{sh_type}", dir=str(env_dir))
         with open(f"{snap_path}_activate.{sh_type}", "wt") as out_f:
             out_f.write(act_script)
-    log.info(
-        "Finished spack snapshot: %s (took %s)", snap_path, (datetime.now() - start)
-    )
-
+    
 
 def update_spack_envs(
     update_ts: str,
@@ -226,6 +266,7 @@ def update_spack_envs(
     if envs is not None:
         envs = set(envs)
     created: Dict[str, Path] = {}
+    spack = get_spack(locs, log_file=log_file)
     for env_name, env_info in conf["spack"].get("envs", {}).items():
         if envs is not None and env_name not in envs:
             continue
@@ -251,7 +292,6 @@ def update_spack_envs(
         #       misbehave when the environment is already activated (skips setting some
         #       env vars). Could be better to pass the "--env" arg to spack? Or fix
         #       the activate bug in spack.
-        spack = get_spack(locs, log_file=log_file)
         spack_env = get_spack(locs, env_dir, log_file=log_file)
         use_slurm = conf.get("build_on_slurm", True)
         slurm_opts = conf["spack"].get("slurm_opts", {})
@@ -270,9 +310,15 @@ def update_spack_envs(
             use_slurm=use_slurm,
             slurm_opts=slurm_opts.get("concretize", {}),
         )
+        spack_push = get_spack_push(
+            spack_env,  
+            n_tasks=n_tasks,
+            use_slurm=use_slurm,
+            slurm_opts=slurm_opts.get("push", {}),
+        )
         try:
             _update_spack_env(
-                env_dir, snap_path, spack, spack_install, spack_concretize
+                env_dir, snap_path, spack, spack_install, spack_concretize, spack_push
             )
         except:
             log.error("Error building spack environment: %s", env_dir)
@@ -282,23 +328,18 @@ def update_spack_envs(
                 env_dir / "spack.lock", locs["spack_env_dir"] / f"{snap_name}.lock"
             )
             created[env_name] = snap_path
+    log.info("Updating spack buildcache index")
+    try:
+        spack.buildcache("update-index", "default")
+    except sh.ErrorReturnCode:
+        log.exception("Error while updating spack buildcache index")
     return created
-
-
-def get_latest_spack_snap(env_name: str, spack_env_dir: Path) -> Path:
-    lock_files = list(spack_env_dir.glob(f"{env_name}*.lock"))
-    lock_files.sort()
-    snap_name = lock_files[0].stem
-    snap_path = spack_env_dir / snap_name
-    if not snap_path.exists() or not snap_path.is_dir():
-        raise ValueError("Can't find snapshot for lock file: %s", lock_files[0])
-    return snap_path
 
 
 def get_spack_env_cmds(
     spack_env: Path, cmds: List[str], log_file: Optional[TextIOWrapper]
 ) -> List[sh.Command]:
-    """Get sh.Commnad referencing a command in the given environment"""
+    """Get sh.Command referencing a command in the given environment"""
     act_path = spack_env.parent / f"{spack_env.name}_activate.sh"
     act_env = get_activated_envrion([act_path.read_text()])
     env_bin = spack_env / "bin"

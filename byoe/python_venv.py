@@ -36,16 +36,18 @@ def update_venv(
     wheels_dir: Path,
     log_file: Optional[TextIOWrapper] = None,
 ):
-    """Update a python virtual environment"""
+    """Create updated python virtual environment and build any new wheels"""
     python = get_spack_env_cmds(spack_snap, ["python"], log_file)[0]
     kwargs = {}
     sys_pkgs = env_info.get("system_packages", True)
     if sys_pkgs:
         kwargs["system-site-packages"] = True
     log.debug("Creating venv: %s", snap_path)
+    build_err: Optional[Exception] = None
     try:
         python("-m", "venv", snap_path, **kwargs)
         pip = get_venv_cmds(spack_snap, snap_path, ["pip"], log_file)[0]
+        pip.install("-U", "pip")
         pip.install("pip-tools")
         pip_compile, pip_sync = get_venv_cmds(
             spack_snap, snap_path, ["pip-compile", "pip-sync"], log_file
@@ -64,18 +66,28 @@ def update_venv(
                 out_f.write(f"{spec}\n")
         lock_path = Path(f"{snap_path}-requirements.txt")
         log.info("Running pip-compile for venv: %s", snap_path)
-        pip_compile(main_req_path, output_file=str(lock_path), generate_hashes=True)
+        pip_compile(
+            main_req_path,
+            output_file=str(lock_path),
+            generate_hashes=True,
+            allow_unsafe=True,
+            verbose=True,
+        )
         log.info("Running pip-sync to build venv: %s", snap_path)
         pip_sync(str(lock_path), pip_args=f"--find-links {wheels_dir}")
-    except:
+    except Exception as e:
+        build_err = e
+        log.error("Python venv update failed: %s", snap_path)
         if snap_path.exists():
             shutil.rmtree(snap_path)
-        raise
-    try:
-        log.debug("Updating python wheels dir")
-        pip.wheel(find_links=str(wheels_dir), w=str(wheels_dir), r=str(lock_path))
-    except:
-        log.exception("Error while building wheels")
+    if snap_path.exists():
+        try:
+            log.debug("Updating python wheels dir")
+            pip.wheel(find_links=str(wheels_dir), w=str(wheels_dir), r=str(lock_path))
+        except:
+            log.exception("Error while building wheels from env: %s", snap_path)
+    if build_err is not None:
+        raise build_err
 
 
 def update_all_venvs(
@@ -85,13 +97,14 @@ def update_all_venvs(
     spack_snaps: Dict[str, Path],
     n_tasks: Optional[int] = None,
     log_file: Optional[TextIOWrapper] = None,
-):
+) -> Dict[str, Path]:
     """Update all python virtual environments"""
     py_info = conf.get("python")
     if not py_info:
         return
     wheels_dir = path_locs["wheels_dir"]
     wheels_dir.mkdir(parents=True, exist_ok=True)
+    built = {}
     for env_name, env_info in py_info.get("envs", {}).items():
         env_info = deepcopy(env_info)
         if "specs" in env_info:
@@ -100,10 +113,15 @@ def update_all_venvs(
             env_info["specs"] = py_info["global_specs"]
         spack_snap = spack_snaps[env_info.get("spack_snap", "default")]
         snap_path = path_locs["venv_dir"] / f"{env_name}-{update_ts}"
-        update_venv(
-            snap_path,
-            env_info,
-            spack_snap,
-            path_locs["wheels_dir"],
-            log_file,
-        )
+        try:
+            update_venv(
+                snap_path,
+                env_info,
+                spack_snap,
+                path_locs["wheels_dir"],
+                log_file,
+            )
+            built["env_name"] = snap_path
+        except Exception:
+            pass
+    return built

@@ -30,6 +30,7 @@ def get_locations(base_dir: Path) -> Dict[str, Path]:
         "lic_dir": base_dir / "licenses",
         "spack_dir": base_dir / "spack",
         "spack_env_dir": base_dir / "spack_envs",
+        "spack_pkg_dir": base_dir / "spack_pkgs",
         "conda_dir": base_dir / "conda",
         "conda_env_dir": base_dir / "conda" / "envs",
         "conda_pkg_dir": base_dir / "conda" / "pkgs",
@@ -39,8 +40,10 @@ def get_locations(base_dir: Path) -> Dict[str, Path]:
     }
 
 
-def get_target_date(period: int, now: Optional[datetime] = None) -> datetime:
-    """Get a target date that matches the given update period"""
+def select_snap(
+    snap_dates: List[datetime], period: int, now: Optional[datetime] = None
+) -> datetime:
+    """Select snapshot date base on the `period` (and `now`)"""
     if now is None:
         now = datetime.now()
     if period > 12:
@@ -54,7 +57,13 @@ def get_target_date(period: int, now: Optional[datetime] = None) -> datetime:
     if 12 % period != 0:
         raise ValueError("Update periods under 12 months must evenly divide 12")
     tgt_month = now.month - (now.month % period)
-    return datetime(now.year, tgt_month)
+    tgt = datetime(now.year, tgt_month, 1)
+    min_delta = min_idx = None
+    for snap_idx, snap_date in enumerate(snap_dates):
+        delta = snap_date - tgt
+        if min_delta is None or delta < min_delta:
+            min_delta, min_idx = delta, snap_idx
+    return snap_dates[min_idx]
 
 
 def get_activated_envrion(
@@ -80,7 +89,7 @@ def get_env_cmd(
     log_file: Optional[TextIOWrapper] = None,
 ):
     """Get a command within a modified environment"""
-    extra_sh_kwargs = {}
+    extra_sh_kwargs = {"_env": env}
     if log_file:
         extra_sh_kwargs["_out"] = log_file
         extra_sh_kwargs["_err"] = log_file
@@ -90,7 +99,7 @@ def get_env_cmd(
         cmd_path = str(cmd)
     else:
         cmd_path = which(str(cmd), _env=env)
-    return getattr(sh, cmd_path).bake(_env=env)
+    return getattr(sh, cmd_path).bake(**extra_sh_kwargs)
 
 
 def wrap_cmd(
@@ -118,5 +127,5 @@ def srun_wrap(
 ) -> sh.Command:
     """Wrap existing sh.Command to run on slurm with 'srun'"""
     srun_args = shlex.split(base_args) + ["--cpus-per-task=%s" % n_cpus]
-    inject_env = None if tmp_dir is None else  {"TMPDIR": tmp_dir}
+    inject_env = None if tmp_dir is None else {"TMPDIR": tmp_dir}
     return wrap_cmd(srun.bake(srun_args), cmd, inject_env)
