@@ -317,7 +317,8 @@ def get_activate_script(
     if channel is None:
         channel = UpdateChannel(os.environ.get("BYOE_CHANNEL", "stable"))
     if shell_type is None:
-        curr_shell = Path(os.environ.get("SHELL", "bash"))
+        curr_shell = Path(os.environ.get("SHELL", "/bin/bash"))
+        curr_shell = curr_shell.stem
         if curr_shell == "bash":
             shell_type = ShellType.SH
         elif curr_shell == "csh":

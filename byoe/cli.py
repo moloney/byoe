@@ -152,13 +152,13 @@ def activate(
     channel: Optional[UpdateChannel] = None,
     time_stamp: Optional[str] = None,
     skip_layer: Optional[List[EnvType]] = None,
-    shell_type: ShellType = ShellType.SH,
+    shell_type: Optional[ShellType] = None,
     tmp: bool = False,
 ):
-    """Produce activation script which can be used with `source \`byoe activate --tmp\``
+    """Produce activation script which can be used with 'source `byoe activate --tmp`'
 
-    To avoid the use of a temp file each time you can do `source <(byoe activate)` in 
-    BASH, or `source (byoe activate | psub)` in FISH. Unfortunately TCSH lacks such 
+    To avoid the use of a temp file each time you can do 'source <(byoe activate)' in 
+    BASH, or 'source (byoe activate | psub)' in FISH. Unfortunately TCSH lacks such 
     functionality.
     """
     # TODO: Raise more specific errors in get_activate_script and convert to error messages here
@@ -172,7 +172,7 @@ def activate(
     )
     if tmp:
         tmp_f = NamedTemporaryFile(delete=False)
-        tmp_f.write(act_script)
+        tmp_f.write(act_script.encode())
         print(tmp_f.name)
     else:
         print(act_script)
