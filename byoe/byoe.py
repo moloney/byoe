@@ -143,9 +143,15 @@ def prep_base_dir(
         tgt = "origin"
         if spack_branch:
             tgt = f"origin/{spack_branch}"
-        # TODO: Would be nice to detect local changes and warn here, make user specify
-        #       --force or similar
-        git("--git-dir", f"{locs['spack_dir'] / '.git'}", "reset", "--hard", tgt)
+        git(
+            "--git-dir",
+            f"{locs['spack_dir'] / '.git'}",
+            "--work-tree",
+            str(locs["spack_dir"]),
+            "reset",
+            "--hard",
+            tgt,
+        )
     spack_lic_dir = locs["spack_dir"] / "etc" / "spack" / "licenses"
     if not spack_lic_dir.exists():
         spack_lic_dir.symlink_to("../../../licenses", True)
