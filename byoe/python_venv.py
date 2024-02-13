@@ -105,6 +105,7 @@ def update_all_venvs(
     wheels_dir = path_locs["wheels_dir"]
     wheels_dir.mkdir(parents=True, exist_ok=True)
     built = {}
+    venv_dir = path_locs["envs_dir"] / "python"
     for env_name, env_info in py_info.get("envs", {}).items():
         env_info = deepcopy(env_info)
         if "specs" in env_info:
@@ -112,7 +113,7 @@ def update_all_venvs(
         else:
             env_info["specs"] = py_info["global_specs"]
         spack_snap = spack_snaps[env_info.get("spack_snap", "default")]
-        snap_path = path_locs["venv_dir"] / f"{env_name}-{update_ts}"
+        snap_path = venv_dir / f"{env_name}-{update_ts}"
         try:
             update_venv(
                 snap_path,

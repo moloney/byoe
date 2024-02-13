@@ -4,16 +4,6 @@ from pathlib import Path
 import typer
 
 
-DEFAULT_SLURM_TASKS = 16
-
-
-DEFAULT_CONF_PATHS = [
-    Path("/etc/byoe.yaml"), 
-    Path(typer.get_app_dir("byoe")) / "byoe.yaml", 
-    Path("./byoe.yaml"),
-]
-
-
 class EnvType(Enum):
     SPACK = "spack"
     PYTHON = "python"
@@ -29,6 +19,7 @@ LOCK_SUFFIXES = {
 
 TS_FORMAT = "%Y%m%d%H%M%S"
 
+
 class UpdateChannel(Enum):
     BLOODY = "bloody"
     FRESH = "fresh"
@@ -37,7 +28,7 @@ class UpdateChannel(Enum):
     OLD = "old"
 
 
-DEFAULT_UPDATE_MONTHS = {
+CHANNEL_UPDATE_MONTHS = {
     UpdateChannel.BLOODY: 1,
     UpdateChannel.FRESH: 3,
     UpdateChannel.STABLE: 6,
@@ -49,4 +40,3 @@ class ShellType(Enum):
     SH = "sh"
     CSH = "csh"
     FISH = "fish"
-

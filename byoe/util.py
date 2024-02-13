@@ -8,7 +8,7 @@ import sh
 
 sh = sh.bake(_tty_out=False)
 
-from ._globals import DEFAULT_SLURM_TASKS
+from ._globals import EnvType
 
 
 bash = sh.bash
@@ -22,21 +22,20 @@ except sh.CommandNotFound:
 
 def get_locations(base_dir: Path) -> Dict[str, Path]:
     """Get paths to key locations under base_dir"""
+    pkg_cache = base_dir / "pkg_cache"
     return {
         "base_dir": base_dir,
-        "startup_dir": base_dir / "startup",
+        "startup_dir": base_dir / "user_rc",
         "log_dir": base_dir / "logs",
         "tmp_dir": base_dir / "tmp",
         "lic_dir": base_dir / "licenses",
         "spack_dir": base_dir / "spack",
-        "spack_env_dir": base_dir / "spack_envs",
-        "spack_pkg_dir": base_dir / "spack_pkgs",
-        "conda_dir": base_dir / "conda",
-        "conda_env_dir": base_dir / "conda" / "envs",
-        "conda_pkg_dir": base_dir / "conda" / "pkgs",
-        "python_dir": base_dir / "python",
-        "venv_dir": base_dir / "python" / "venvs",
-        "wheels_dir": base_dir / "python" / "wheels",
+        "envs_dir": base_dir / "envs",
+        "apps_dir": base_dir / "apps",
+        "pkg_cache_dir": pkg_cache,
+        "spack_pkg_dir": pkg_cache / "spack",
+        "wheels_dir": pkg_cache / "python",
+        "conda_pkg_dir": pkg_cache / "conda",
     }
 
 
@@ -98,7 +97,7 @@ def get_env_cmd(
     if cmd.is_absolute():
         cmd_path = str(cmd)
     else:
-        cmd_path = which(str(cmd), _env=env)
+        cmd_path = which(str(cmd), _env=env).strip("\n")
     return getattr(sh, cmd_path).bake(**extra_sh_kwargs)
 
 

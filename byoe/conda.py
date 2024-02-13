@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 
 def get_micromamba(path_locs: Dict[str, Path]):
-    mamba_activate_path = path_locs["conda_dir"] / "load_micromamba.sh"
+    mamba_activate_path = path_locs["envs_dir"] / "conda" / "load_micromamba.sh"
     # TODO: this function expects a spack env, spack load also requires base spack env setup
     micromamba = get_env_cmd(micromamba)
     return micromamba
@@ -41,9 +41,9 @@ def update_all_conda_envs(
     conda_info = conf_data.get("conda", {})
     if not conda_info:
         return
-    path_locs["conda_pkg_dir"].mkdir(exist_ok=True)
-    path_locs["conda_env_dir"].mkdir(exist_ok=True)
-    conda_conf = path_locs["conda_dir"] / "condarc"
+    conda_dir = path_locs["envs_dir"] / "conda"
+    conda_dir.mkdir(exist_ok=True)
+    conda_conf = conda_dir / "condarc"
     conda_conf.write_text(
         yaml.dump(
             {
@@ -53,7 +53,7 @@ def update_all_conda_envs(
         )
     )
     conda_cmd = get_micromamba(path_locs).bake(
-        rc_file=str(conda_conf), root_prefix=path_locs["conda_dir"]
+        rc_file=str(conda_conf), root_prefix=conda_dir
     )
     for env_name, env_info in conda_info.get("envs", {}).items():
         env_info = deepcopy(env_info)

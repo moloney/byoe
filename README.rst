@@ -40,6 +40,9 @@ repo and run ``./bootstrap-no-sys-python.sh`` from the root directory of the rep
 This will create a virtual environment at ``./byoe_venv`` with this package installed.
 
 
+Basic Usage
+===========
+
 Building Environments
 ---------------------
 
@@ -59,8 +62,10 @@ environments. This can take a long time, especially on the first run, so check t
 corresponding log file under the ``{base_dir}/logs`` directory for progress.
 
 
+
+
 Known Issues
-------------
+============
 
 Spack doesn't handle certain configuration files being split between different scopes,
 and in particular you may need to delete any ``~/.spack/linux/compilers.yaml`` file

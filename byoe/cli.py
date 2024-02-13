@@ -1,18 +1,20 @@
-import sys, logging
+import os, sys, logging
+from dataclasses import asdict
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
 
+import yaml
 import typer
 from rich.console import Console
 import sh
 
-from ._globals import DEFAULT_CONF_PATHS, EnvType, UpdateChannel, ShellType
-from .util import get_locations
+from ._globals import EnvType, UpdateChannel, ShellType, CHANNEL_UPDATE_MONTHS
+from .util import get_activated_envrion, get_env_cmd, get_locations
+from .conf import MissingConfigError, UserConfig, get_user_conf, SiteConfig
 from .spack import get_spack
 from .byoe import (
-    get_config,
     NoCompilerFoundError,
     prep_base_dir,
     update_all,
@@ -36,7 +38,7 @@ conf_data = {}
 def main(
     verbose: bool = False,
     debug: bool = False,
-    config: Optional[Path] = None,
+    base_dir: Optional[Path] = None,
 ):
     """
     Manage environments
@@ -57,13 +59,30 @@ def main(
     else:
         stream_handler.setLevel(logging.WARN)
     root_logger.addHandler(stream_handler)
-    conf_paths = DEFAULT_CONF_PATHS
-    if config:
-        conf_paths.append(config)
-    conf_data.update(get_config(conf_paths))
+    conf_path = os.environ.get("BYOE_USER_CONF")
+    if conf_path:
+        conf_path = Path(conf_path)
+    else:
+        conf_path = Path(typer.get_app_dir("byoe")) / "conf.yaml"
+    try: 
+        conf_data["user"] = get_user_conf(conf_path)
+    except MissingConfigError:
+        pass
+    if base_dir is not None:
+        if "user" in conf_data:
+            conf_data["user"].base_dir = base_dir
+        else:
+            conf_data["user"] = UserConfig(base_dir)
+    if "user" not in conf_data:
+        if sys.stdout.isatty():
+            conf_data["user"] = UserConfig.build_interactive()
+            conf_path.parent.mkdir(exist_ok=True)
+            conf_path.write_text(conf_data["user"].dump())
+        else:
+            error_console.write("No user config at: {conf_path}")
 
 
-@cli.command()
+@cli.command(rich_help_panel="Admin Commands")
 def init_dir(
     n_tasks: Optional[int] = None,
     log_path: Optional[Path] = None,
@@ -81,7 +100,7 @@ def init_dir(
         return 1
     update_ts = datetime.now().strftime("%Y%m%d%H%M%S")
     if log_path is None:
-        log_path = conf_data["base_dir"] / "logs" / f"prep_base_{update_ts}.log"
+        log_path = conf_data["user"].base_dir / "logs" / f"init_dir_{update_ts}.log"
     log.info("Logging prep_base_dir run to file: %s" % log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w")
@@ -90,13 +109,13 @@ def init_dir(
     root_logger = logging.getLogger("")
     root_logger.addHandler(file_handler)
     try:
-        prep_base_dir(conf_data, n_tasks, log_file)
+        prep_base_dir(conf_data["user"].base_dir, n_tasks, log_file)
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
 
 
-@cli.command()
+@cli.command(rich_help_panel="Admin Commands")
 def update_envs(
     n_tasks: Optional[int] = None,
     log_path: Optional[Path] = None,
@@ -108,7 +127,7 @@ def update_envs(
         return 1
     update_ts = datetime.now().strftime("%Y%m%d%H%M%S")
     if log_path is None:
-        log_path = conf_data["base_dir"] / "logs" / f"update_envs_{update_ts}.log"
+        log_path = conf_data["user"].base_dir / "logs" / f"update_envs_{update_ts}.log"
     log.info("Logging update_envs run to file: %s" % log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w")
@@ -124,11 +143,12 @@ def update_envs(
 
 
 @cli.command(
+    rich_help_panel="Admin Commands",
     context_settings={
         "allow_extra_args": True,
         "ignore_unknown_options": True,
         "help_option_names": ["--byoe-help"],
-    }
+    },
 )
 def spack(ctx: typer.Context):
     """Forward commands to internal `spack` command (use `--byoe-help` for details)
@@ -138,15 +158,51 @@ def spack(ctx: typer.Context):
     Administrators must be careful when running commands that mutate state, and
     generally avoid commands that update configuration.
     """
-    locs = get_locations(conf_data["base_dir"])
+    locs = get_locations(conf_data["user"].base_dir)
     spack_cmd = get_spack(locs).bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
     try:
         spack_cmd(ctx.args)
-    except sh.ErrorReturnCode:
-        pass
+    except sh.ErrorReturnCode as e:
+        return e.exit_code
 
 
-@cli.command()
+@cli.command(
+    rich_help_panel="User Commands",
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "help_option_names": ["--byoe-help"],
+    },
+)
+def run(
+    ctx: typer.Context,
+    byoe_name: Optional[str] = None,
+    byoe_channel: Optional[UpdateChannel] = None,
+    byoe_time_stamp: Optional[str] = None,
+    byoe_skip_layer: Optional[List[EnvType]] = None,
+    byoe_shell_type: Optional[ShellType] = None,
+):
+    """Run the given command inside a byoe environment (use `--byoe-help` for details)"""
+    act_script = get_activate_script(
+        conf_data["user"].base_dir,
+        byoe_name,
+        byoe_channel,
+        byoe_time_stamp,
+        byoe_skip_layer,
+        ShellType.SH,
+    )
+    # TODO: If we're launching this in a shell we should just source the activation
+    #       script there before running the users code. Also since we are running a
+    #       shell anyway, might as well run the user command in there too?
+    act_env = get_activated_envrion([act_script])
+    cmd = get_env_cmd(ctx.args[0], act_env)
+    try:
+        cmd(ctx.args[1:], _in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
+    except sh.ErrorReturnCode as e:
+        return e.exit_code
+
+
+@cli.command(rich_help_panel="User Commands")
 def activate(
     name: Optional[str] = None,
     channel: Optional[UpdateChannel] = None,
@@ -157,8 +213,8 @@ def activate(
 ):
     """Produce activation script which can be used with 'source `byoe activate --tmp`'
 
-    To avoid the use of a temp file each time you can do 'source <(byoe activate)' in 
-    BASH, or 'source (byoe activate | psub)' in FISH. Unfortunately TCSH lacks such 
+    To avoid the use of a temp file each time you can do 'source <(byoe activate)' in
+    BASH, or 'source (byoe activate | psub)' in FISH. Unfortunately TCSH lacks such
     functionality.
     """
     # TODO: Raise more specific errors in get_activate_script and convert to error messages here
@@ -168,7 +224,7 @@ def activate(
                 "If skipping 'spack' layer, 'python' must also be skipped"
             )
     act_script = get_activate_script(
-        conf_data["base_dir"], name, channel, time_stamp, skip_layer, shell_type
+        conf_data["user"].base_dir, name, channel, time_stamp, skip_layer, shell_type
     )
     if tmp:
         tmp_f = NamedTemporaryFile(delete=False)
