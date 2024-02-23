@@ -3,7 +3,7 @@ from dataclasses import asdict
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Annotated, Optional, List
 
 import yaml
 import typer
@@ -12,12 +12,12 @@ import sh
 
 from ._globals import EnvType, UpdateChannel, ShellType, CHANNEL_UPDATE_MONTHS
 from .util import get_activated_envrion, get_env_cmd, get_locations
-from .conf import MissingConfigError, UserConfig, get_user_conf, SiteConfig
+from .conf import MissingConfigError, UserConfig, get_user_conf, IncludableConfig
 from .spack import get_spack
 from .byoe import (
     NoCompilerFoundError,
     prep_base_dir,
-    update_all,
+    do_update,
     get_activate_script,
 )
 
@@ -34,7 +34,7 @@ cli = typer.Typer()
 conf_data = {}
 
 
-@cli.callback()
+@cli.callback(no_args_is_help=True)
 def main(
     verbose: bool = False,
     debug: bool = False,
@@ -77,20 +77,17 @@ def main(
         if sys.stdout.isatty():
             conf_data["user"] = UserConfig.build_interactive()
             conf_path.parent.mkdir(exist_ok=True)
-            conf_path.write_text(conf_data["user"].dump())
+            conf_path.write_text(yaml.dump(conf_data["user"].to_dict()))
         else:
             error_console.write("No user config at: {conf_path}")
 
 
 @cli.command(rich_help_panel="Admin Commands")
 def init_dir(
-    n_tasks: Optional[int] = None,
+    pull_spack: bool = True,
     log_path: Optional[Path] = None,
 ):
-    """Prepare the configured base directory
-
-    This could take a while to run the first time, particularly if we need to build
-    any compilers.
+    """Prepare the configured base directory, including fetching updating spack repo
 
     Calling this is optional, mostly useful if you want to prepopulate some sub
     directories (e.g. licenses) before calling 'update_envs'.
@@ -109,19 +106,19 @@ def init_dir(
     root_logger = logging.getLogger("")
     root_logger.addHandler(file_handler)
     try:
-        prep_base_dir(conf_data["user"].base_dir, n_tasks, log_file)
+        prep_base_dir(conf_data["user"].base_dir, pull_spack, log_file)
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
 
 
 @cli.command(rich_help_panel="Admin Commands")
-def update_envs(
-    n_tasks: Optional[int] = None,
-    log_path: Optional[Path] = None,
+def update(
+    env_or_app: Annotated[Optional[List[str]], typer.Argument] = None,
     pull_spack: bool = True,
+    log_path: Optional[Path] = None,
 ):
-    """Update configured environments"""
+    """Update all configured environments and apps, or just those specified as args"""
     if not conf_data:
         error_console.print("Unable to find config")
         return 1
@@ -135,8 +132,16 @@ def update_envs(
     file_handler.setLevel(logging.INFO)
     root_logger = logging.getLogger("")
     root_logger.addHandler(file_handler)
+    if len(env_or_app) == 0:
+        env_or_app = None
     try:
-        update_all(update_ts, conf_data, pull_spack, n_tasks, log_file)
+        do_update(
+            conf_data["user"].base_dir, 
+            update_ts,
+            env_or_app,
+            pull_spack=pull_spack, 
+            log_file=log_file,
+        )
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1

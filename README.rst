@@ -43,30 +43,52 @@ This will create a virtual environment at ``./byoe_venv`` with this package inst
 Basic Usage
 ===========
 
+A BYOE repository is a directory where all of the configuration and data (software 
+environments, pkgs, etc.) are stored. On single user systems the default location under
+the user home directory is probably reasonable provided there is enough space. On 
+multi user systems there is generally going to be a single shared repository managed 
+by one or more "admins".
+
+If a user configuration doesn't exist, the first time any commands are run you will be
+interactively prompted to populate one. The first question will be for the ``base_dir`` 
+which provides the location of the BYOE repository.
+
+
+Using Environments
+------------------
+
+If you are on a multi-user system with an existing repository you can start using the
+provided environments immediately.
+
+If you want to run a single command in a BYOE environment you can use the ``byoe run``
+command.
+
+If instead you want to modify your current shell, you can use the ``byoe activate`` 
+command but  the precise usage depends on the shell you are using. For BASH users doing 
+``source <(byoe activate)`` is the recommneded approach, while FISH users can do 
+``source (byoe activate | psub)``. Finally ``source $(byoe activate --tmp)`` works in 
+all shells including CSH but leaves behind temp files.
+
+
 Building Environments
 ---------------------
 
-You will need a configuration file, the ``example_conf`` directory provides an example.
-If you are building centralized environments for multiple users, configure the 
-``base_dir`` to point to a shared directory. If you have a Slurm cluster you wish to use 
-to compile software, you should configure it now.
+If you are on a single user system or you are an admin for a multi-user system you 
+will need to configure and periodically build your BYOE envrionments. The 
+``site_conf.yaml`` inside the repository is used for this configuration.
 
 You can run the ``init-dir`` subcommand to prepare the defined ``base_dir``, which is 
 useful if you need to prepopulate the contained ``licenses`` directory with any 
-software licenses you need to build your environments. This will also install updated
-binutils, compiler, and micromamba through spack, so it may take some time to complete
-on the first run.
+software licenses you need to build your environments. 
 
-Running the ``update-envs`` command will build updated versions of all the defined 
+Running the ``update`` command will build updated versions of all the defined 
 environments. This can take a long time, especially on the first run, so check the
 corresponding log file under the ``{base_dir}/logs`` directory for progress.
-
-
 
 
 Known Issues
 ============
 
 Spack doesn't handle certain configuration files being split between different scopes,
-and in particular you may need to delete any ``~/.spack/linux/compilers.yaml`` file
-before using ``byoe``.
+and in particular you may need to rename/delete any ``~/.spack/linux/compilers.yaml`` 
+file before using ``byoe``.

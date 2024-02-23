@@ -21,14 +21,13 @@ from ._globals import (
     ShellType,
 )
 from .util import get_locations, select_snap
-from .conf import SiteConfig
+from .conf import SiteConfig, EnvConfig, AppConfig, BuildConfig, IncludableConfig
 from .spack import (
-    update_compiler_conf,
     get_spack,
-    get_spack_install,
     update_spack_env,
+    get_compilers,
 )
-from .python_venv import update_all_venvs
+from .python_venv import update_python_env
 from .conda import update_all_conda_envs
 
 
@@ -87,6 +86,8 @@ def prep_base_dir(
     log_file: Optional[TextIOWrapper] = None,
 ) -> SiteConfig:
     """Make sure the base_dir is initialized"""
+    # Set the base_dir so our IncludableConfig subclasses can consume relative paths
+    IncludableConfig.base_dir = base_dir
     locs = get_locations(base_dir)
     for loc in locs.values():
         loc.mkdir(exist_ok=True)
@@ -111,10 +112,10 @@ def prep_base_dir(
         else:
             log.warning("No site config found, creating default")
             site_conf = SiteConfig()
-        site_conf_path.write_text(site_conf.dump())
+        site_conf_path.write_text(yaml.dump(site_conf.to_dict()))
     else:
-        site_conf = SiteConfig.build(base_dir, yaml.safe_load(site_conf_path.read_text()))
-    # Build / update spack install
+        site_conf = SiteConfig.from_dict(yaml.safe_load(site_conf_path.read_text()))
+    # Create / update spack git repo
     branch = site_conf.spack_global.repo_branch
     if not (spack_dir / ".git").exists():
         log.info("Cloning spack into: %s", spack_dir)
@@ -154,16 +155,6 @@ def prep_base_dir(
     (spack_global_config_path / "mirrors.yaml").write_text(
         yaml.dump({"mirrors": mirrors})
     )
-    # TODO: Trying to move most this to the env config, need to check if compilers config
-    #       needs to be global
-    # Create any needed spack config files
-    # for sect_name, sect_data in conf_data["spack"].items():
-    #     if sect_name in ("envs", "global_specs", "slurm_build", "externals", "gpg"):
-    #         # These sections are only meaningful to BYOE
-    #         continue
-    #     conf_path = locs["spack_dir"] / "etc" / "spack" / f"{sect_name}.yaml"
-    #     with open(conf_path, "wt") as conf_f:
-    #         yaml.safe_dump({sect_name: sect_data}, conf_f)
     # Get basic "spack" command wrapper
     spack = get_spack(locs, log_file=log_file)
     # Setup GPG key for signing spack packages
@@ -173,7 +164,9 @@ def prep_base_dir(
         "email": "byoe@noreply.org",
         "comment": "Generated internally by BYOE for signing packages",
     }
-    if not re.search(r"^uid\s+byoe_build\s.+", spack.gpg.list(), flags=re.MULTILINE):
+    if not re.search(
+        r"^uid\s+(\[.+\])?\s*byoe_build\s.+", spack.gpg.list(), flags=re.MULTILINE
+    ):
         kwargs = {}
         if "comment" in def_gpg:
             kwargs["comment"] = def_gpg["comment"]
@@ -186,63 +179,16 @@ def prep_base_dir(
     #         continue
     #     # TODO: Need to test for existance first?
     #     spack.gpg.trust(gpg_info)
-    # TODO: Need to just build skeleton here, build compiliers/binutils/micromamba etc. 
-    #       lazily  during update_envs. How much compiler/binutils/externals config can 
-    #       be done in the environment?
-    # Get specialized "spack install" command wrapper
     # Make sure spack is bootstrapped
     log.info("Bootstrapping spack")
     spack.bootstrap.now()
-
+    # We keep an updated list of system compilers in the spack site config
+    log.info("Checking for system compilers")
+    spack.compiler.find(scope="site")
+    sys_compilers = get_compilers(spack)
+    if len(sys_compilers) == 0:
+        raise NoCompilerFoundError()
     # TODO: Try to push this into 'update_envs'
-    # # 
-    # use_slurm = conf_data.get("build_on_slurm", True)
-    # slurm_opts = conf_data["spack"].get("slurm_opts", {})
-    # use_slurm = use_slurm and slurm_opts.get("enabled", True)
-    # spack_install = get_spack_install(
-    #     spack,
-    #     locs["tmp_dir"],
-    #     n_tasks=n_tasks,
-    #     use_slurm=use_slurm,
-    #     slurm_opts=slurm_opts.get("install", {}),
-    # )
-    # log.info("Looking for externals")
-    # for external in conf_data["spack"].get("externals", []):
-    #     spack.external.find("--scope", "site", external)
-    # log.info("Checking compilers")
-    # spack.compiler.find(scope="site")
-    # compilers = [x.strip() for x in spack.compiler.list().split("\n")[2:] if x]
-    # if len(compilers) == 0:
-    #     raise NoCompilerFoundError()
-    # log.info("Checking binutils")
-    # binutils_vers = conf_data.get("binutils_version", "2.40")
-    # try:
-    #     binutils_loc = spack.location(first=True, i=f"binutils@{binutils_vers}")
-    # except sh.ErrorReturnCode:
-    #     log.info("Updating binutils")
-    #     spack_install([f"binutils@{binutils_vers}", "+ld", "+gas"])
-    #     binutils_loc = spack.location(first=True, i=f"binutils@{binutils_vers}")
-    # binutils_loc = Path(binutils_loc.strip())
-    # # Install compilers as needed, configuring them to use our updated binutils
-    # needed_compilers = []
-    # for comp in (
-    #     conf_data["spack"].get("packages", {}).get("all", {}).get("compiler", [])
-    # ):
-    #     needed_compilers.append(comp)
-    # for env_info in conf_data["spack"].get("envs", {}).values():
-    #     for comp in env_info.get("packages", {}).get("all", {}).get("compiler", []):
-    #         needed_compilers.append(comp)
-    # needed_compilers = [x for x in needed_compilers if x not in compilers]
-    # if needed_compilers:
-    #     for comp in needed_compilers:
-    #         log.info("Installing compiler: %s", comp)
-    #         spack_install([comp])
-    #         spack.compiler.find(
-    #             "--scope", "site", spack.location(first=True, i=comp).strip()
-    #         )
-    #     update_compiler_conf(
-    #         spack_dir / "etc" / "spack" / "compilers.yaml", binutils_loc
-    #     )
     # # Install micromamba for building our "conda" environments
     # try:
     #     spack.find("micromamba")
@@ -254,7 +200,7 @@ def prep_base_dir(
     return locs, site_conf
 
 
-def build_env(
+def _build_env(
     env_name: str, 
     env_conf: EnvConfig, 
     locs: Dict[str, Path], 
@@ -266,32 +212,42 @@ def build_env(
         spack_snap = update_spack_env(
             env_name, env_conf.spack, locs, update_ts, build_config, log_file
         )
+        if spack_snap is None:
+            return
         if env_conf.python:
-            pass # TODO: Build python env ontop of spack_snap
+            update_python_env(
+                env_name, env_conf.python, spack_snap, locs, update_ts, log_file
+            )
+    elif env_conf.conda:
+        pass # TODO: Build conda env
 
 
-def update_all(
+def do_update(
     base_dir: Path,
     update_ts: str,
-    envs: Optional[List[str]] = None,
-    apps: Optional[List[str]] = None,
+    envs_or_apps: Optional[List[str]] = None,
     pull_spack: bool = True,
     log_file: Optional[TextIOWrapper] = None,
 ):
-    """Perform all updates to configured environments"""
+    """Perform updates to configured environments and apps"""
     locs, site_conf = prep_base_dir(base_dir, pull_spack, log_file)
     if site_conf.envs is None and site_conf.apps is None:
         log.warning("Nothing to do, no 'envs' or 'apps' defined")
         return
-    if envs is None and site_conf.envs:
-        envs = site_conf.envs.keys()
-    if apps is None:
-        apps = site_conf.apps.keys()
+    if envs_or_apps is None:
+        envs = [] if site_conf.envs is None else list(site_conf.envs.keys())
+        apps = [] if site_conf.apps is None else list(site_conf.apps.keys())
+    else:
+        if site_conf.envs:
+            envs = [x for x in site_conf.envs.keys() if x in envs_or_apps]
+        if site_conf.apps:
+            apps =  [x for x in site_conf.apps.keys() if x in envs_or_apps]
     for env_name in envs:
         env_conf = site_conf.envs[env_name]
         if site_conf.defaults:
             env_conf.set_defaults(site_conf.defaults)
-        build_env(env_name, env_conf, locs, update_ts, site_conf.build_opts, log_file)
+        _build_env(env_name, env_conf, locs, update_ts, site_conf.build_opts, log_file)
+    # TODO: Update apps
 
 
 def get_snaps(
@@ -328,7 +284,7 @@ def get_activate_script(
     if EnvType.CONDA in skip_layer:
         active_types.remove(EnvType.CONDA)
     if name is None:
-        name = os.environ.get("BYOE_DEFAULT_ENV_NAME", "default")
+        name = os.environ.get("BYOE_DEFAULT_ENV_NAME", "main")
     if channel is None:
         channel = UpdateChannel(os.environ.get("BYOE_CHANNEL", "stable"))
     if shell_type is None:
@@ -350,8 +306,8 @@ def get_activate_script(
         snaps["spack"] = get_snaps(base_dir, EnvType.SPACK, name)
     if EnvType.PYTHON not in skip_layer:
         snaps["python"] = get_snaps(base_dir, EnvType.PYTHON, name)
-    if EnvType.CONDA not in skip_layer:
-        snaps["conda"] = get_snaps(base_dir, EnvType.CONDA, name)
+    # if EnvType.CONDA not in skip_layer:
+    #     snaps["conda"] = get_snaps(base_dir, EnvType.CONDA, name)
     snap_sets = list(snaps.values())
     valid_dates = {x.env_date for x in snap_sets[0]}
     for snap_set in snap_sets[1:]:

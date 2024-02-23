@@ -55,7 +55,7 @@ def select_snap(
         return datetime(tgt_year)
     if 12 % period != 0:
         raise ValueError("Update periods under 12 months must evenly divide 12")
-    tgt_month = now.month - (now.month % period)
+    tgt_month = now.month - ((now.month - 1) % period)
     tgt = datetime(now.year, tgt_month, 1)
     min_delta = min_idx = None
     for snap_idx, snap_date in enumerate(snap_dates):
