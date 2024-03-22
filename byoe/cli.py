@@ -1,5 +1,4 @@
 import os, sys, logging
-from dataclasses import asdict
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 from datetime import datetime
@@ -10,16 +9,10 @@ import typer
 from rich.console import Console
 import sh
 
-from ._globals import EnvType, UpdateChannel, ShellType, CHANNEL_UPDATE_MONTHS
-from .util import get_activated_envrion, get_env_cmd, get_locations
-from .conf import MissingConfigError, UserConfig, get_user_conf, IncludableConfig
-from .spack import get_spack
-from .byoe import (
-    NoCompilerFoundError,
-    prep_base_dir,
-    do_update,
-    get_activate_script,
-)
+from .globals import EnvType, UpdateChannel, ShellType, SnapId
+from .util import get_activated_envrion, get_env_cmd
+from .conf import MissingConfigError, UserConfig, get_user_conf
+from .byoe import NoCompilerFoundError, ByoeRepo
 
 
 log = logging.getLogger("byoe")
@@ -87,7 +80,7 @@ def init_dir(
     pull_spack: bool = True,
     log_path: Optional[Path] = None,
 ):
-    """Prepare the configured base directory, including fetching updating spack repo
+    """Prepare the configured base directory, including fetching and updating spack repo
 
     Calling this is optional, mostly useful if you want to prepopulate some sub
     directories (e.g. licenses) before calling 'update_envs'.
@@ -105,8 +98,9 @@ def init_dir(
     file_handler.setLevel(logging.INFO)
     root_logger = logging.getLogger("")
     root_logger.addHandler(file_handler)
+    repo = ByoeRepo(conf_data["user"].base_dir)
     try:
-        prep_base_dir(conf_data["user"].base_dir, pull_spack, log_file)
+        repo.prep_dir(pull_spack, log_file)
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
@@ -114,7 +108,7 @@ def init_dir(
 
 @cli.command(rich_help_panel="Admin Commands")
 def update(
-    env_or_app: Annotated[Optional[List[str]], typer.Argument] = None,
+    env_or_app: Annotated[Optional[List[str]], typer.Argument()] = None,
     pull_spack: bool = True,
     log_path: Optional[Path] = None,
 ):
@@ -134,10 +128,9 @@ def update(
     root_logger.addHandler(file_handler)
     if len(env_or_app) == 0:
         env_or_app = None
+    repo = ByoeRepo(conf_data["user"].base_dir)
     try:
-        do_update(
-            conf_data["user"].base_dir, 
-            update_ts,
+        repo.update(
             env_or_app,
             pull_spack=pull_spack, 
             log_file=log_file,
@@ -163,12 +156,12 @@ def spack(ctx: typer.Context):
     Administrators must be careful when running commands that mutate state, and
     generally avoid commands that update configuration.
     """
-    locs = get_locations(conf_data["user"].base_dir)
-    spack_cmd = get_spack(locs).bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
+    repo = ByoeRepo(conf_data["user"].base_dir)
+    spack_cmd = repo.get_spack().bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
     try:
         spack_cmd(ctx.args)
     except sh.ErrorReturnCode as e:
-        return e.exit_code
+        raise typer.Exit(code=e.exit_code)
 
 
 @cli.command(
@@ -188,8 +181,8 @@ def run(
     byoe_shell_type: Optional[ShellType] = None,
 ):
     """Run the given command inside a byoe environment (use `--byoe-help` for details)"""
-    act_script = get_activate_script(
-        conf_data["user"].base_dir,
+    repo = ByoeRepo(conf_data["user"].base_dir)
+    act_script = repo.get_activate_script(
         byoe_name,
         byoe_channel,
         byoe_time_stamp,
@@ -204,32 +197,32 @@ def run(
     try:
         cmd(ctx.args[1:], _in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
     except sh.ErrorReturnCode as e:
-        return e.exit_code
+        raise typer.Exit(code=e.exit_code)
 
 
 @cli.command(rich_help_panel="User Commands")
 def activate(
-    name: Optional[str] = None,
+    env_name: Optional[str] = None,
     channel: Optional[UpdateChannel] = None,
-    time_stamp: Optional[str] = None,
-    skip_layer: Optional[List[EnvType]] = None,
+    snap_id: Optional[str] = None,
+    skip_py_env: bool = False,
+    disable: Optional[List[str]] = None,
+    enable: Optional[List[str]] = None,
     shell_type: Optional[ShellType] = None,
     tmp: bool = False,
 ):
-    """Produce activation script which can be used with 'source `byoe activate --tmp`'
+    """Print activation script for an environment plus any number of apps.
 
-    To avoid the use of a temp file each time you can do 'source <(byoe activate)' in
-    BASH, or 'source (byoe activate | psub)' in FISH. Unfortunately TCSH lacks such
-    functionality.
+    Most users (i.e. BASH users) can do 'source <(byoe activate)' to change their
+    current shell environment. Users with FISH as their shell can do 
+    'source (byoe activate | psub)', while any shell (e.g. TCSH) can do 
+    'source $(activate --tmp)' with the downside of leaving behind a tmp file.
     """
-    # TODO: Raise more specific errors in get_activate_script and convert to error messages here
-    if EnvType.SPACK in skip_layer:
-        if EnvType.PYTHON not in skip_layer:
-            error_console.print(
-                "If skipping 'spack' layer, 'python' must also be skipped"
-            )
-    act_script = get_activate_script(
-        conf_data["user"].base_dir, name, channel, time_stamp, skip_layer, shell_type
+    if snap_id is not None:
+        snap_id = SnapId.from_str(snap_id)
+    repo = ByoeRepo(conf_data["user"].base_dir)
+    act_script = repo.get_activate_script(
+        env_name, channel, snap_id, skip_py_env, disable, enable, shell_type
     )
     if tmp:
         tmp_f = NamedTemporaryFile(delete=False)
@@ -237,3 +230,8 @@ def activate(
         print(tmp_f.name)
     else:
         print(act_script)
+
+
+@cli.command(rich_help_panel="User Commands")
+def status(short: bool = False):
+    """Print info about any currently activated environment or apps"""

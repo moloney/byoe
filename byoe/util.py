@@ -2,13 +2,13 @@ import os, shlex, json
 from datetime import datetime
 from pathlib import Path
 from io import TextIOWrapper
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Tuple, Union
 
 import sh
 
 sh = sh.bake(_tty_out=False)
 
-from ._globals import EnvType
+from .globals import ShellType, SnapId, SnapSpec
 
 
 bash = sh.bash
@@ -20,27 +20,8 @@ except sh.CommandNotFound:
     HAS_SLURM = False
 
 
-def get_locations(base_dir: Path) -> Dict[str, Path]:
-    """Get paths to key locations under base_dir"""
-    pkg_cache = base_dir / "pkg_cache"
-    return {
-        "base_dir": base_dir,
-        "startup_dir": base_dir / "user_rc",
-        "log_dir": base_dir / "logs",
-        "tmp_dir": base_dir / "tmp",
-        "lic_dir": base_dir / "licenses",
-        "spack_dir": base_dir / "spack",
-        "envs_dir": base_dir / "envs",
-        "apps_dir": base_dir / "apps",
-        "pkg_cache_dir": pkg_cache,
-        "spack_pkg_dir": pkg_cache / "spack",
-        "wheels_dir": pkg_cache / "python",
-        "conda_pkg_dir": pkg_cache / "conda",
-    }
-
-
 def select_snap(
-    snap_dates: List[datetime], period: int, now: Optional[datetime] = None
+    snap_ids: List[SnapId], period: int, now: Optional[datetime] = None
 ) -> datetime:
     """Select snapshot date base on the `period` (and `now`)"""
     if now is None:
@@ -58,11 +39,26 @@ def select_snap(
     tgt_month = now.month - ((now.month - 1) % period)
     tgt = datetime(now.year, tgt_month, 1)
     min_delta = min_idx = None
-    for snap_idx, snap_date in enumerate(snap_dates):
-        delta = snap_date - tgt
+    for snap_idx, snap_id in enumerate(snap_ids):
+        delta = snap_id.time_stamp - tgt
         if min_delta is None or delta < min_delta:
             min_delta, min_idx = delta, snap_idx
-    return snap_dates[min_idx]
+    return snap_ids[min_idx]
+
+
+def get_closest_snap(
+    tgt: SnapId, avail: List[Tuple[SnapSpec, ...]]
+) -> Optional[Tuple[SnapSpec, ...]]:
+    """Select the SnapSpec to use given the `tgt` SnapId"""
+    for idx, snaps in enumerate(avail):
+        if snaps[0].snap_id == tgt:
+            return snaps
+        elif snaps[0].snap_id > tgt:
+            if idx != 0:
+                return avail[idx - 1]
+            return snaps
+    if avail:
+        return avail[-1]
 
 
 def get_activated_envrion(
@@ -74,6 +70,7 @@ def get_activated_envrion(
     """
     if base_env is None:
         base_env = os.environ.copy()
+    activation_scripts = [str(x) for x in activation_scripts]
     bash_cmd = "\n".join(
         activation_scripts
         + ['python -c "import json, os ; print(json.dumps(dict(os.environ)))"']
@@ -82,11 +79,26 @@ def get_activated_envrion(
     return json.loads(env_json_str)
 
 
+def get_ssl_env():
+    """Get environment variables to handle alternative TLS/SSL cert locations
+
+    For now we just handle Redhat.
+    """
+    env_data = {}
+    alt_cert_dir = Path("/etc/pki/tls/certs")
+    if alt_cert_dir.exists():
+        env_data["SSL_CERT_DIR"] = str(alt_cert_dir)
+    alt_cert_file = Path("/etc/pki/tls/cert.pem")
+    if alt_cert_file.exists():
+        env_data["SSL_CERT_FILE"] = str(alt_cert_file)
+    return env_data
+
+
 def get_env_cmd(
     cmd: Union[str, Path],
     env: Dict[str, str],
     log_file: Optional[TextIOWrapper] = None,
-):
+) -> sh.Command:
     """Get a command within a modified environment"""
     extra_sh_kwargs = {"_env": env}
     if log_file:
@@ -128,3 +140,30 @@ def srun_wrap(
     srun_args = shlex.split(base_args) + ["--cpus-per-task=%s" % n_cpus]
     inject_env = None if tmp_dir is None else {"TMPDIR": tmp_dir}
     return wrap_cmd(srun.bake(srun_args), cmd, inject_env)
+
+
+def make_app_act_script(snap_dir: Path, shell_type: ShellType) -> str:
+    """Create an activation script for isolate app snapshot"""
+    if shell_type == ShellType.SH:
+        return "\n".join(
+            [
+                f"export PATH={snap_dir / 'bin'}:$PATH",
+                f"export MANPATH={snap_dir / 'man'}:$MANPATH",
+            ]
+        )
+    elif shell_type == ShellType.CSH:
+        return "\n".join(
+            [
+                f"setenv PATH {snap_dir / 'bin'}:$PATH",
+                f"setenv MANPATH {snap_dir / 'man'}:$MANPATH",
+            ]
+        )
+    elif shell_type == ShellType.FISH:
+        return "\n".join(
+            [
+                f"set -gx PATH {snap_dir / 'bin'}:$PATH",
+                f"set -gx MANPATH {snap_dir / 'man'}:$MANPATH",
+            ]
+        )
+    else:
+        raise NotImplementedError

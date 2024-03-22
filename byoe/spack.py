@@ -1,5 +1,6 @@
 """Manage / build spack environments"""
-import os, sys, logging, shutil, time
+
+import os, logging, shutil
 from datetime import datetime
 from pathlib import Path
 from copy import deepcopy
@@ -12,51 +13,12 @@ import sh
 sh = sh.bake(_tty_out=False)
 git = sh.git
 
-from .util import get_activated_envrion, get_env_cmd, srun_wrap, HAS_SLURM, wrap_cmd
-from .conf import BuildConfig, SpackConfig, get_job_build_info
+from .globals import SnapId, SnapSpec
+from .util import get_activated_envrion, get_env_cmd, srun_wrap, wrap_cmd
+from .conf import BuildConfig, SpackBuildChain, SpackConfig, get_job_build_info
 
 
 log = logging.getLogger(__name__)
-
-
-def get_spack(
-    path_locs: Dict[str, Path],
-    env: Optional[Path] = None,
-    modules: Optional[List[str]] = None,  # TODO: Remove this?
-    log_file: Optional[TextIOWrapper] = None,
-) -> Dict[str, str]:
-    """Get modified environment with basic spack setup"""
-    spack_dir = path_locs["spack_dir"]
-    tmp_dir = path_locs["tmp_dir"]
-    env_data = os.environ.copy()
-    # TODO: Better way of handling SSL certificate locations for PBS bootstrapped installs?
-    env_data.update(
-        {
-            "SPACK_ROOT": str(spack_dir),
-            "PATH": f"{spack_dir / 'bin'}:{os.environ['PATH']}",
-            "SPACK_PYTHON": sys.executable,
-            "TMPDIR": str(tmp_dir),
-        }
-    )
-    # Handle alt locations for SSL/TLS certs (for now just redhat)
-    alt_cert_dir = Path("/etc/pki/tls/certs")
-    if alt_cert_dir.exists():
-        env_data["SSL_CERT_DIR"] = str(alt_cert_dir)
-    alt_cert_file = Path("/etc/pki/tls/cert.pem")
-    if alt_cert_file.exists():
-        env_data["SSL_CERT_FILE"] = str(alt_cert_file)
-    spack = get_env_cmd(path_locs["spack_dir"] / "bin" / "spack", env_data)
-    act_scripts = []
-    if env:
-        act_scripts.append(spack.env.activate("--sh", "-d", str(env)))
-    if modules:
-        act_scripts.append(spack.load("--first", "--sh", *modules))
-    if act_scripts:
-        env_data = get_activated_envrion(act_scripts, env_data)
-        spack = spack.bake(_env=env_data)
-    if log_file:
-        spack = spack.bake(_out=log_file, _err=log_file, _tee={"err", "out"})
-    return spack
 
 
 install_script = """\
@@ -100,9 +62,9 @@ def par_spack(
     if build_info["use_slurm"] and not slurm_cpus:
         cmd = srun_wrap(
             cmd,
-            n_tasks,
+            str(n_tasks),
             build_info.get("srun_args", ""),
-            build_info.get("tmp_dir"),
+            str(build_info.get("tmp_dir")),
         )
     return cmd
 
@@ -110,19 +72,19 @@ def par_spack(
 def get_spack_install(
     spack: sh.Command,
     base_tmp: Path,
-    timestamp: str = None,
+    run_id: str = None,
     fresh: bool = True,
     yes_to_all: bool = True,
     build_config: Optional[BuildConfig] = None,
 ) -> sh.Command:
     """Get a preconfigured 'spack install' command"""
-    if timestamp is None:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    install_script_path = base_tmp / f"spack_install-{timestamp}.sh"
+    if run_id is None:
+        run_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    install_script_path = base_tmp / f"spack_install-{run_id}.sh"
     install_script_path.touch(0o770)
     install_script_path.write_text(install_script)
     install_cmd = sh.Command(str(install_script_path))
-    install_cmd = install_cmd.bake(base_tmp / f"error-stage-dirs-{timestamp}")
+    install_cmd = install_cmd.bake(base_tmp / f"error-stage-dirs-{run_id}")
     install_args = []
     if fresh:
         install_args.append("--fresh")
@@ -146,8 +108,8 @@ def get_spack_concretize(
     if fresh:
         conc_args.append("--fresh")
     return par_spack(
-        spack.concretize, 
-        conc_args, 
+        spack.concretize,
+        conc_args,
         get_job_build_info(build_config, "spack_concretize"),
     )
 
@@ -185,15 +147,9 @@ def conv_view_links(view_dir: Path):
                 pass
 
 
-def get_compilers(spack, env=None):
+def get_compilers(spack):
     """Get compilers spack knows about"""
-    if env:
-        return [
-            x.strip() for x in spack("-e", env, "compiler", "list").split("\n")[2:] 
-            if x.strip()
-        ]
-    else:
-        return [x.strip() for x in spack.compiler.list().split("\n")[2:] if x.strip()]
+    return [x.strip() for x in spack.compiler.list().split("\n")[2:] if x.strip()]
 
 
 def _update_compiler_conf(compiler_conf: Path, binutils_path: Path):
@@ -206,6 +162,108 @@ def _update_compiler_conf(compiler_conf: Path, binutils_path: Path):
     yaml.dump(data, compiler_conf.open("w"))
 
 
+def setup_build_chains(
+    spack: sh.Command,
+    spack_install: sh.Command,
+    buildchains: List[SpackBuildChain],
+    conf_path: Path,
+    conf_scope: str,
+) -> None:
+    """Configure one or more buildchains, installing any missing pieces as needed"""
+    compilers = get_compilers(spack)
+    missing_build_deps = set()
+    for bc in buildchains:
+        compiler = binutils = None
+        if bc.compiler is not None and bc.compiler not in missing_build_deps:
+            compiler = bc.compiler
+            # TODO: Using 'startswith' here is hacky but works for common use of just
+            #       specifying the major version and then matching the full version (e.g.
+            #       spec "gcc@12" and then match "gcc@12.3.0"). Supporting specs with less-
+            #       than or greater-than could be useful.
+            if not any(c.startswith(compiler) for c in compilers):
+                try:
+                    spack.find(compiler)
+                except sh.ErrorReturnCode:
+                    missing_build_deps.add(compiler)
+                else:
+                    comp_loc = spack.location(first=True, i=compiler).strip()
+                    spack.compiler.find("--scope", conf_scope, comp_loc)
+        if bc.binutils is not None:
+            binutils = bc.binutils
+            if bc.compiler is None:
+                # TODO: A user could have explicity listed a system compiler here...
+                #       Would be nice to just support system compilers here, just awkward
+                #       to implement since we store them in the global spack "site" level
+                #       config currently, to avoid overloading the environments spack.yaml
+                #       with a bunch of compiler definitions that might not get used in that
+                #       environment. If we set the binutils version in the global config
+                #       we can't build environments in parallel. Need to see if we can
+                #       override the system config of a compiler with and environment config.
+                raise ValueError("Can't set non-system binutils for system compiler")
+            try:
+                spack.find(binutils)
+            except sh.ErrorReturnCode:
+                missing_build_deps.add(binutils)
+            else:
+                binutils_path = Path(spack.location(first=True, i=binutils).strip())
+                _update_compiler_conf(conf_path, binutils_path)
+    if missing_build_deps:
+        log.info("Installing missing build dependencies: %s", missing_build_deps)
+        for build_dep in missing_build_deps:
+            spack_install(build_dep)
+        for bc in buildchains:
+            if bc.compiler in missing_build_deps:
+                comp_loc = spack.location(first=True, i=bc.compiler).strip()
+                spack.compiler.find("--scope", conf_scope, comp_loc)
+                binutils_path = Path(spack.location(first=True, i=bc.binutils).strip())
+                _update_compiler_conf(conf_path, binutils_path)
+
+
+def _prep_spack_build(
+    env_dir: Path,
+    snap_path: Path,
+    spack: sh.Command,
+    spack_config: SpackConfig,
+    build_config: BuildConfig,
+    base_tmp: Path,
+):
+    """Prepare an environment for building"""
+    # Initialize the environment config file
+    env_dir.mkdir(parents=True)
+    if spack_config.config is not None:
+        env_info = deepcopy(spack_config.config)
+    else:
+        env_info = {}
+    env_info["specs"] = spack_config.specs[:]
+    if not env_info["specs"]:
+        log.warning("No specs defined for spack env: %s", env_dir)
+        return
+    env_info["view"] = {
+        "default": {
+            "root": str(snap_path),
+            "link": "all",
+            "link_type": "symlink",
+        }
+    }
+    spec_path = env_dir / "spack.yaml"
+    with spec_path.open("wt") as spec_f:
+        yaml.safe_dump({"spack": env_info}, spec_f)
+    # Setup any needed buildchains for the env
+    if spack_config.build_chains is not None:
+        spack_install = get_spack_install(spack, base_tmp, build_config=build_config)
+        setup_build_chains(
+            spack,
+            spack_install,
+            spack_config.build_chains,
+            env_dir / "spack.yaml",
+            f"env:{env_dir}",
+        )
+    # Setup any externals for the env
+    if spack_config.externals:
+        for external in spack_config.externals:
+            spack.external.find("--scope", f"env:{env_dir}", external)
+
+
 def _update_spack_env(
     env_dir: Path,
     snap_path: Path,
@@ -214,7 +272,7 @@ def _update_spack_env(
     spack_concretize: sh.Command,
     spack_push: sh.Command,
 ) -> None:
-    """Create updated snapshot of a single environment"""
+    """Create updated snapshot of a single environment and cache any built packages"""
     start = datetime.now()
     log.info("Concretizing spack snapshot: %s", snap_path)
     conc_out = spack_concretize()
@@ -246,148 +304,89 @@ def _update_spack_env(
             out_f.write(act_script)
 
 
-def _prep_spack_build(
-    env_dir: Path, 
-    spack: sh.Command, 
-    spack_config: SpackConfig, 
-    build_config: BuildConfig,
-    base_tmp: Path,
-):
-    # Configure the environments build deps, installing any that are missing
-    missing_build_deps = []
-    compiler = binutils =  None
-    if spack_config.compiler is not None:
-        compiler = spack_config.compiler
-        compilers = get_compilers(spack, env_dir)
-        # TODO: Using 'startswith' here is hacky but works for common use of just 
-        #       specifying the major version and then matching the full version (e.g. 
-        #       spec "gcc@12" and then match "gcc@12.3.0"). Supporting specs with less-
-        #       than or greater-than could be useful.
-        if not any(c.startswith(compiler) for c in compilers):
-            try:
-                spack.find(compiler)
-            except sh.ErrorReturnCode:
-                missing_build_deps.append(compiler)
-            else:
-                comp_loc = spack.location(first=True, i=compiler)
-                spack("-e", env_dir, "compiler", "find", "--scope", env_dir, comp_loc)
-    if spack_config.binutils is not None:
-        binutils = spack_config.binutils
-        if spack_config.compiler is None:
-            # TODO: A user could have explicity listed a system compiler here...
-            #       Would be nice to just support system compilers here, just awkward 
-            #       to implement since we store them in the global spack "site" level
-            #       config currently, to avoid overloading the environments spack.yaml
-            #       with a bunch of compiler definitions that might not get used in that
-            #       environment. If we set the binutils version in the global config
-            #       we can't build environments in parallel. Need to see if we can 
-            #       override the system config of a compiler with and environment config.
-            raise ValueError("Can't set non-system binutils for system compiler")
-        try:
-            spack.find(binutils)
-        except sh.ErrorReturnCode:
-            missing_build_deps.append(binutils)
-        else:
-            binutils_path =  spack.location(first=True, i=binutils)
-            _update_compiler_conf(env_dir / "spack.yaml", binutils_path)
-    if missing_build_deps:
-        log.info("Installing missing build dependencies")
-        spack_install = get_spack_install(spack, base_tmp, build_config=build_config)
-        for build_dep in missing_build_deps:
-            spack_install(build_dep)
-        if compiler in missing_build_deps:
-            comp_loc = spack.location(first=True, i=compiler)
-            spack(
-                "-e", env_dir, "compiler", "find", "--scope", f"env:{env_dir}", comp_loc
-            )
-        if binutils in missing_build_deps or compiler in missing_build_deps:
-            binutils_path =  spack.location(first=True, i=spack_config.binutils)
-            _update_compiler_conf(env_dir / "spack.yaml", binutils_path)
-    # Setup any externals
-    if spack_config.externals:
-        for external in spack_config.externals:
-            spack(
-                "-e", env_dir, "external", "find", "--scope", f"env:{env_dir}", external
-            )
-
-
 def update_spack_env(
+    spack: sh.Command,
     env_name: str,
     spack_config: SpackConfig,
     locs: Dict[str, Path],
-    update_ts: str,
+    snap_id: SnapId,
     build_config: Optional[BuildConfig] = None,
-    log_file: Optional[TextIOWrapper] = None,
-) -> Path:
+) -> Optional[SnapSpec]:
     """Update and snapshot a spack environment"""
     if build_config is None:
         build_config = BuildConfig()
-    spack = get_spack(locs, log_file=log_file)
-    spack_envs_dir = locs["envs_dir"] / "spack"
+    spack_envs_dir = locs["envs"] / "spack"
     spack_envs_dir.mkdir(exist_ok=True)
-    # TODO: Package config updates seem to be ignored sometimes, which might be fixed
-    #       by putting the env_dir under some unique name in the tmp dir each time
-    env_dir = spack_envs_dir / env_name
-    env_dir.mkdir(parents=True, exist_ok=True)
-    spec_path = env_dir / "spack.yaml"
-    snap_name = f"{env_name}-{update_ts}"
-    snap_path = spack_envs_dir / snap_name
+    env_dir = spack_envs_dir / env_name / f"{snap_id}-env"
+    snap_path = spack_envs_dir / env_name / str(snap_id)
+    spack_env = spack.bake(e=env_dir)
     log.info("Updating spack snap: %s", snap_path)
-    if spack_config.etc is not None:
-        env_info = deepcopy(spack_config.etc)
-    else:
-        env_info = {}
-    env_info["specs"] = spack_config.specs[:]
-    if not env_info["specs"]:
-        log.warning("No specs defined for spack env: %s", env_name)
-        return
-    env_info["view"] = {
-        "default": {
-            "root": str(snap_path),
-            "link": "all",
-            "link_type": "symlink",
-        }
-    }
-    with spec_path.open("wt") as spec_f:
-        yaml.safe_dump({"spack": env_info}, spec_f)
-    log.info("Preparing to build env: %s", env_name)
     try:
-        _prep_spack_build(env_dir, spack, spack_config, build_config, locs["tmp_dir"])
+        _prep_spack_build(
+            env_dir, snap_path, spack_env, spack_config, build_config, locs["tmp"]
+        )
     except:
-        log.error("Error preparing spack environment: %s", env_dir)
+        log.exception("Error preparing spack environment: %s", env_dir)
+        if env_dir.exists():
+            shutil.rmtree(env_dir)
         return None
     # Prepare spack concretize/install/push commands for the environment
-    spack_env = get_spack(locs, env_dir, log_file=log_file)
     spack_install = get_spack_install(
-        spack_env, locs["tmp_dir"], update_ts, build_config,
+        spack_env, locs["tmp"], str(snap_id), build_config
     )
     spack_concretize = get_spack_concretize(spack_env, build_config)
     spack_push = get_spack_push(spack_env, build_config)
+    lock_path = spack_envs_dir / env_name / f"{snap_id}.lock"
+    success = True
     try:
         _update_spack_env(
             env_dir, snap_path, spack, spack_install, spack_concretize, spack_push
         )
     except:
         log.error("Error building spack environment: %s", env_dir)
-        return None
+        success = False
     else:
         conv_view_links(snap_path)
-        shutil.copy(
-            env_dir / "spack.lock", spack_envs_dir / f"{snap_name}.lock"
-        )
+        shutil.copy(env_dir / "spack.lock", lock_path)
     log.info("Updating spack buildcache index")
     try:
         spack.buildcache("update-index", "default")
     except sh.ErrorReturnCode:
         log.exception("Error while updating spack buildcache index")
-    return snap_path
+    if not success:
+        if env_dir.exists():
+            shutil.rmtree(env_dir)
+        return None
+    return SnapSpec.from_lock_path(lock_path)
 
 
 def get_spack_env_cmds(
-    spack_env: Path, cmds: List[str], log_file: Optional[TextIOWrapper]
+    spack_env: Path,
+    cmds: List[str],
+    base_env: Optional[Dict[str, str]] = None,
+    log_file: Optional[TextIOWrapper] = None,
 ) -> List[sh.Command]:
     """Get sh.Command referencing a command in the given environment"""
     act_path = spack_env.parent / f"{spack_env.name}_activate.sh"
-    act_env = get_activated_envrion([act_path.read_text()])
+    act_env = get_activated_envrion([act_path.read_text()], base_env)
     env_bin = spack_env / "bin"
     return [get_env_cmd(env_bin / cmd, act_env, log_file) for cmd in cmds]
+
+
+def get_spack_pkg_cmds(
+    spec: str,
+    cmds: List[str],
+    spack: sh.Command,
+    spack_install: sh.Command,
+    base_env: Optional[Dict[str, str]] = None,
+    log_file: Optional[TextIOWrapper] = None,
+) -> sh.Command:
+    """Get a command from a spack package, installing it if needed"""
+    try:
+        spack.find(spec)
+    except sh.ErrorReturnCode:
+        log.info("Installing spack package: %s", spec)
+        spack_install([spec])
+    act_script = spack.load("--sh", spec)
+    act_env = get_activated_envrion([act_script], base_env)
+    return [get_env_cmd(cmd, act_env, log_file) for cmd in cmds]

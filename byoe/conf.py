@@ -10,7 +10,7 @@ from typing import ClassVar, Dict, List, Optional, Union, Any
 import yaml
 import click
 
-from ._globals import UpdateChannel, CHANNEL_UPDATE_MONTHS
+from .globals import UpdateChannel, CHANNEL_UPDATE_MONTHS
 from .util import HAS_SLURM
 
 
@@ -23,8 +23,10 @@ DEFAULT_SLURM_TASKS = 16
 class ConfigError(Exception):
     pass
 
+
 class MissingConfigError(ConfigError):
     pass
+
 
 class InvalidConfigError(ConfigError):
     pass
@@ -59,6 +61,7 @@ def _update_nested(base_dict, key, value):
 @dataclass
 class Config:
     """Base for specifying config as dataclass"""
+
     def to_dict(self) -> Dict[str, Any]:
         res = {}
         for field in fields(self):
@@ -75,7 +78,7 @@ class Config:
             else:
                 res[attr] = val
         return res
-    
+
     def set_defaults(self, def_config: "Config") -> None:
         for field in fields(def_config):
             new_def_val = getattr(def_config, field.name)
@@ -99,7 +102,7 @@ class Config:
     def get_defaults(cls):
         """Get the default values for the dataclass"""
         return {f.name: f.default for f in fields(cls)}
-    
+
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
         for attr, hint in typing.get_type_hints(cls).items():
@@ -122,17 +125,19 @@ class Config:
                     conf_data[attr] = tgt_class.from_dict(conf_data[attr])
                 elif issubclass(tgt_class, Enum):
                     conf_data[attr] = tgt_class(conf_data[attr].lower())
-                elif conf_data[attr] is not None and not isinstance(conf_data[attr], tgt_class):
+                elif conf_data[attr] is not None and not isinstance(
+                    conf_data[attr], tgt_class
+                ):
                     conf_data[attr] = tgt_class(conf_data[attr])
         res = cls(**conf_data)
         res._explicitly_set = set(conf_data.keys())
-        return cls(**conf_data)
+        return res
 
 
 @dataclass
 class UserConfig(Config):
     """User specific configuration"""
-    
+
     base_dir: Path = "~/.byoe_repo"
 
     channel: UpdateChannel = UpdateChannel.STABLE
@@ -145,12 +150,12 @@ class UserConfig(Config):
     def build_interactive(cls):
         defaults = cls.get_defaults()
         base_dir = click.prompt(
-            "Enter the path to the base directory for the repository", 
-            default=defaults["base_dir"], 
-            type=Path
+            "Enter the path to the base directory for the repository",
+            default=defaults["base_dir"],
+            type=Path,
         ).expanduser()
         update_freq = click.prompt(
-            "Choose your default environment update frequency in months", 
+            "Choose your default environment update frequency in months",
             type=click.Choice(CHANNEL_UPDATE_MONTHS.values()),
             default=CHANNEL_UPDATE_MONTHS[defaults["channel"]],
         )
@@ -179,10 +184,16 @@ def get_user_conf(conf_path: Path) -> UserConfig:
 @dataclass
 class IncludableConfig(Config):
     """Base class for config that can have include statements
-    
+
     The `base_dir` must be set on this class before using any subclasses"""
 
     base_dir: ClassVar[Optional[Path]] = None
+
+
+    @classmethod
+    def filt_include(cls, include_data):
+        """Subclasses can override this method to modify / filter included data"""
+        return include_data
 
     # TODO: Need support for recursive includes with loop detection here
     @classmethod
@@ -192,7 +203,9 @@ class IncludableConfig(Config):
         if includes:
             include_data = {}
             for include in includes:
-                include_data.update(yaml.safe_load(_get_conf_content(cls.base_dir, include)))
+                include_data.update(
+                    cls.filt_include(yaml.safe_load(_get_conf_content(cls.base_dir, include)))
+                )
             include_data.update(conf_data)
             conf_data = include_data
         for attr, hint in typing.get_type_hints(cls).items():
@@ -216,19 +229,28 @@ class IncludableConfig(Config):
                     conf_data[attr] = tgt_class(conf_data[attr].lower())
                 elif not isinstance(conf_data[attr], tgt_class):
                     conf_data[attr] = tgt_class(conf_data[attr])
-        return cls(**conf_data)
+        res = cls(**conf_data)
+        res._explicitly_set = set(conf_data.keys())
+        return res
+
+
+@dataclass
+class SpackBuildChain(Config):
+    """Spack build-chain specification"""
+    compiler: Optional[str] = None
+
+    binutils: Optional[str] = None
 
 
 @dataclass
 class SpackConfig(IncludableConfig):
     """Spack specific configuration for an environment"""
-    compiler: Optional[str] = None
 
-    binutils: Optional[str] = None
+    build_chains: Optional[List[SpackBuildChain]] = None
 
     externals: Optional[List[str]] = None
 
-    etc: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
 
     specs: Optional[List[str]] = None
 
@@ -236,34 +258,47 @@ class SpackConfig(IncludableConfig):
 @dataclass
 class PythonConfig(IncludableConfig):
     """Python specific configuration for an environment"""
-    system_packages: bool = True
+    
+    specs: List[str]
 
-    specs: Optional[List[str]] = None
+    system_packages: bool = True
 
 
 @dataclass
 class CondaConfig(IncludableConfig):
     """Conda specific configuration for an environment"""
-    
-    specs: Optional[List[str]] = None
+
+    channels: List[str]
+
+    specs: List[str]
+
+    @classmethod
+    def filt_include(cls, include_data):
+        for key in include_data:
+            if key not in ("channels", "specs", "dependencies"):
+                del include_data["key"]
+        if "dependencies" in include_data:
+            include_data["specs"] = include_data["dependencies"]
+            del include_data["dependencies"]
+        return include_data
 
 
 @dataclass
 class EnvConfig(IncludableConfig):
     """Config for an environment"""
+
     spack: Optional[SpackConfig] = None
 
     python: Optional[PythonConfig] = None
 
     conda: Optional[CondaConfig] = None
 
-    def __postinit__(self):
+    def __post_init__(self):
         if self.spack is not None and self.conda is not None:
             raise InvalidConfigError("Can't mix spack / conda in same environment")
-    
+
     def set_defaults(
-        self, 
-        defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
+        self, defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
     ) -> None:
         for attr in ("spack", "python", "conda"):
             if getattr(self, attr) and attr in defaults:
@@ -271,21 +306,46 @@ class EnvConfig(IncludableConfig):
 
 
 @dataclass
-class _AppConfigMixin:
-    
-    exported_bin: Dict[str, Any]
+class CondaAppConfig(IncludableConfig):
+    """Config for isolated Conda app"""
+
+    conda: CondaConfig
+
+    exported: Optional[Dict[str, str]] = None
 
     default: bool = True
 
-    
+    def set_defaults(
+        self, defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
+    ) -> None:
+        if "conda" in defaults:
+            self.conda.set_defaults[defaults["conda"]]
+
+
 @dataclass
-class AppConfig(EnvConfig, _AppConfigMixin):
-    """Config for an isolated app"""
+class PythonAppConfig(IncludableConfig):
+    """Config for isolated Python app"""
+
+    python: PythonConfig
+
+    python_spec: Optional[str] = None
+
+    spack: Optional[SpackConfig] = None
+
+    default: bool = True
+
+    def set_defaults(
+        self, defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
+    ) -> None:
+        for attr in ("spack", "python"):
+            if getattr(self, attr) and attr in defaults:
+                getattr(self, attr).set_defaults[defaults[attr]]
 
 
 @dataclass
 class SlurmBuildConfig(Config):
     """Config for building on Slurm"""
+
     enabled: bool = True
 
     tasks_per_job: int = 12
@@ -300,12 +360,28 @@ class SlurmBuildConfig(Config):
 @dataclass
 class BuildConfig(Config):
     """Config for building environments / apps"""
+
     # TODO: rename to max_local_tasks
     max_tasks: int = os.cpu_count() // 2
 
     tmp_dir: Optional[Path] = None
 
     slurm_config: Optional[Dict[str, SlurmBuildConfig]] = None
+
+    @classmethod
+    def from_dict(cls, conf_data: Dict[str, Any]):
+        tmp_dir = conf_data.get("tmp_dir")
+        if tmp_dir:
+            conf_data["tmp_dir"] = Path(tmp_dir)
+        slurm_conf = conf_data.get("slurm_config")
+        if slurm_conf:
+            conf_data["slurm_config"] = {
+                name: SlurmBuildConfig.from_dict(sub_conf)
+                for name, sub_conf in slurm_conf.items()
+            }
+        res = cls(**conf_data)
+        res._explicitly_set = set(conf_data.keys())
+        return res
 
 
 def get_job_build_info(build_config: Optional[BuildConfig], job_type: str):
@@ -329,12 +405,17 @@ def get_job_build_info(build_config: Optional[BuildConfig], job_type: str):
                 "tmp_dir": slurm_info.tmp_dir,
                 "srun_args": slurm_info.srun_args,
             }
-    return {"use_slurm": False, "n_tasks": build_config.max_tasks, "tmp_dir": build_config.tmp_dir}
+    return {
+        "use_slurm": False,
+        "n_tasks": build_config.max_tasks,
+        "tmp_dir": build_config.tmp_dir,
+    }
 
 
 @dataclass
 class GlobalSpackConfig(Config):
     """Spack config that is handled globally (not per env/app)"""
+
     repo_url: str = "https://github.com/spack/spack.git"
 
     repo_branch: str = "develop"
@@ -345,19 +426,36 @@ class GlobalSpackConfig(Config):
 
 
 @dataclass
+class GlobalCondaConfig(Config):
+    """Conda config that is handled globally"""
+    source: str = "https://micro.mamba.pm/api/micromamba"
+
+    build_chain: Optional[SpackBuildChain] = None
+
+    def __post_init__(self):
+        if self.source != "spack" and self. build_chain is not None:
+            raise InvalidConfigError(
+                "Specifying 'build_chain' only valid if 'source' is 'spack'"
+            )
+
+
+@dataclass
 class SiteConfig(Config):
     """Full configuration for a site"""
+
     spack_global: GlobalSpackConfig = field(default_factory=GlobalSpackConfig)
+
+    conda_global: GlobalCondaConfig = field(default_factory=GlobalCondaConfig)
 
     build_opts: BuildConfig = field(default_factory=BuildConfig)
 
     defaults: Optional[Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]] = None
 
-    apps: Optional[Dict[str, AppConfig]] = None
+    apps: Optional[Dict[str, Union[CondaAppConfig, PythonAppConfig]]] = None
 
     envs: Optional[Dict[str, EnvConfig]] = None
 
-    def __postinit__(self):
+    def __post_init__(self):
         app_names = set() if self.apps is None else set(self.apps.keys())
         env_names = set() if self.envs is None else set(self.envs.keys())
         collisions = app_names & env_names
@@ -366,38 +464,55 @@ class SiteConfig(Config):
                 f"Environments and apps can't share names: {','.join(collisions)}"
             )
 
+    def to_dict(self):
+        res = {}
+        for field in fields(self):
+            val = getattr(self, field.name)
+            if val is None:
+                continue
+            if field.name in ("defaults", "apps", "envs"):
+                res[field.name] = {k : v.to_dict() for k, v in val.items()}
+            else:
+                res[field.name] = val.to_dict()
+        return res
+
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
         spack_global = conf_data.get("spack_global")
         if spack_global:
             conf_data["spack_global"] = GlobalSpackConfig.from_dict(spack_global)
+        conda_global = conf_data.get("conda_global")
+        if conda_global:
+            conf_data["conda_global"] = GlobalCondaConfig.from_dict(conda_global)
         build_opts = conf_data.get("build_opts")
         if build_opts:
             conf_data["build_opts"] = BuildConfig.from_dict(build_opts)
         apps = conf_data.get("apps")
         if apps:
-            conf_data["apps"] = {
-                name: AppConfig.from_dict(app_conf) 
-                for name, app_conf in apps.items()
-            }
+            converted = {}
+            for name, app_conf in apps.items():
+                if "conda" in app_conf:
+                    converted[name] = CondaAppConfig.from_dict(app_conf)
+                else:
+                    converted[name] = PythonAppConfig.from_dict(app_conf)
+            conf_data["apps"] = converted
         envs = conf_data.get("envs")
         if envs:
             conf_data["envs"] = {
-                name: EnvConfig.from_dict(env_conf) 
-                for name, env_conf in envs.items()
+                name: EnvConfig.from_dict(env_conf) for name, env_conf in envs.items()
             }
-        return cls(**conf_data)
+        res = cls(**conf_data)
+        res._explicitly_set = set(conf_data.keys())
+        return res
 
     @classmethod
     def build_interactive(cls):
         spack_repo = click.prompt(
-            "Enter the git repo URL for spack", 
-            default="https://github.com/spack/spack.git", 
-            type=str
+            "Enter the git repo URL for spack",
+            default="https://github.com/spack/spack.git",
+            type=str,
         )
         spack_branch = click.prompt(
-            "Enter the git branch to use for spack", 
-            default="develop", 
-            type=str
+            "Enter the git branch to use for spack", default="develop", type=str
         )
         return cls(GlobalSpackConfig(spack_repo, spack_branch))

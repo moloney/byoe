@@ -2,14 +2,22 @@
 Bring Your Own Environment
 ==========================
 
-Build and manage modern software stacks, even on old systems, with a focus on HPC.
+Build and manage modern, reproducible, scientific software stacks anywhere, with a focus 
+on HPC.
 
-Uses ``spack`` to build base environments which in turn are used to create python
-virtual environments where we can install the most recent versions of any python 
-packages. We augment the available applications with ``conda`` packages as needed, 
-although these are isolated from the spack base environment and any python virtual 
-environments.
+Combines the package ecosystems of `Spack <https://spack.io/>`_, 
+`Conda <https://docs.conda.io/en/latest/>`_, and `PYPI <https://pypi.org/>`_ to provide
+a huge amount up-to-date software. The use of Spack allows custom compilation when
+needed, including the ability to link to system libraries or compile alternative 
+versions of them. Python virutal environments can then be layered on top of spack 
+environments to provide access to the full PYPI package ecosystem. Software can be either 
+integrated into a base "environment", or installed as an isolated application. The 
+latter option is particularly useful for integrating software with conflicting or 
+otherwise hard to satisfy dependencies.
 
+Supports compiling software with spack on a Slurm cluster. All packages are cached to 
+avoid repeating work, and these caches are available to users to speed up their own 
+custom environment builds.
 
 Install
 =======
@@ -84,6 +92,9 @@ software licenses you need to build your environments.
 Running the ``update`` command will build updated versions of all the defined 
 environments. This can take a long time, especially on the first run, so check the
 corresponding log file under the ``{base_dir}/logs`` directory for progress.
+
+Once you have a working build it is recommended you create a scheduled task to run 
+``byoe update`` around the first of each month.
 
 
 Known Issues

@@ -22,5 +22,3 @@ tar -xzf python.tar.gz && rm python.tar.gz
 cd -
 ._internal/python/bin/python3 -m venv byoe_venv
 byoe_venv/bin/pip install .
-# TODO: User needs to setup config file first... should we run this here?
-#byoe_venv/bin/byoe bootstrap

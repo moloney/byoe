@@ -1,11 +1,15 @@
-import os, logging
+import json
+import logging, io, tarfile, platform, requests, re
+import os
+from shutil import copyfileobj, rmtree
 from pathlib import Path
-from copy import deepcopy
-from typing import Dict, Any
+from typing import Dict
 
 import yaml
 import sh
 from sh import CommandNotFound
+
+from byoe.util import make_app_act_script
 
 sh = sh.bake(_tty_out=False)
 try:
@@ -14,48 +18,203 @@ try:
 except CommandNotFound:
     HAS_SLURM = False
 
-from .util import get_env_cmd
+from .globals import EnvType, ShellType, SnapId, SnapSpec, LOCK_SUFFIXES
+from .conf import CondaAppConfig, CondaConfig
 
 
 log = logging.getLogger(__name__)
 
 
-def get_micromamba(path_locs: Dict[str, Path]):
-    mamba_activate_path = path_locs["envs_dir"] / "conda" / "load_micromamba.sh"
-    # TODO: this function expects a spack env, spack load also requires base spack env setup
-    micromamba = get_env_cmd(micromamba)
-    return micromamba
+class UnsupportedPlatformError(Exception):
+    pass
 
 
-def update_conda_env(conda_cmd: sh.Command, snap_name: str, env_info):
+def get_conda_platform() -> str:
+    """Get the Conda platform matching our system"""
+    sys_name = platform.system().lower()
+    if sys_name == "darwin":
+        sys_name = "osx"
+    elif sys_name == "windows":
+        sys_name = "win"
+    arch_name = platform.machine()
+    if arch_name in ("x86_64", "x64"):
+        arch_name = "64"
+    elif arch_name.startswith("arm") or arch_name.startswith("aarch"):
+        if sys_name == "linux":
+            arch_name = "aarch64"
+        elif sys_name == "osx":
+            arch_name = "arm64"
+        else:
+            raise UnsupportedPlatformError()
+    return f"{sys_name}-{arch_name}"
+
+
+def get_mm_url(base_url: str, version="latest") -> str:
+    """Get URL to download micromamba from"""
+    conda_platform = get_conda_platform()
+    return f"{base_url}/{conda_platform}/{version}"
+
+
+def fetch_prebuilt(
+    bin_dir: Path,
+    base_url: str = "https://micro.mamba.pm/api/micromamba",
+    version="latest",
+) -> Path:
+    """Download and unpack prebuilt micromamba binary"""
+    full_url = get_mm_url(base_url, version)
+    log.info("Downloading prebuilt micromamba from: %s", full_url)
+    tar_data = io.BytesIO(requests.get(full_url).content)
+    tf = tarfile.open(fileobj=tar_data, mode="r:*")
+    for mem in tf:
+        fn = mem.name.split("/")[-1]
+        out_path = bin_dir / fn
+        if fn in ("micromamba", "micromamba.exe"):
+            src = tf.extractfile(mem)
+            with out_path.open("wb") as dest:
+                copyfileobj(src, dest)
+            out_path.chmod(out_path.stat().st_mode | 0o000550)
+            return out_path
+    raise ValueError("Unable to find micromamba executable")
+
+
+def update_conda_env(
+    env_name: str,
+    conda_config: CondaConfig,
+    conda_lock: sh.Command,
+    micromamba: sh.Command,
+    locs: Dict[str, Path],
+    snap_id: SnapId,
+) -> SnapSpec:
     """Create updated snapshot of a conda environment"""
-    conda_cmd.create(name=snap_name)
-    # TODO
-
-
-def update_all_conda_envs(
-    update_ts: str,
-    conf_data: dict[str, Any],
-    path_locs: Dict[str, Path],
-):
-    conda_info = conf_data.get("conda", {})
-    if not conda_info:
-        return
-    conda_dir = path_locs["envs_dir"] / "conda"
-    conda_dir.mkdir(exist_ok=True)
-    conda_conf = conda_dir / "condarc"
-    conda_conf.write_text(
-        yaml.dump(
-            {
-                "channels": conda_info["channels"],
-                "pkg_dirs": [path_locs["conda_pkg_dir"]],
-            }
+    envs_dir = locs["envs"] / "conda"
+    snap_dir = envs_dir / env_name / str(snap_id)
+    snap_dir.parent.mkdir(parents=True, exist_ok=True)
+    conf_data = {}
+    if not conda_config.channels:
+        raise ValueError("No channels given for conda env '%s'", env_name)
+    if not conda_config.specs:
+        raise ValueError("No specs given for conda env '%s'", env_name)
+    conf_data["channels"] = conda_config.channels
+    conf_data["dependencies"] = conda_config.specs
+    abstract_conf_path = envs_dir / env_name / f"{snap_id}-in.yml"
+    abstract_conf_path.write_text(yaml.dump(conf_data))
+    lock_path = envs_dir / env_name / f"{snap_id}-lock.yml"
+    log.info("Running conda-lock on input: %s", abstract_conf_path)
+    try:
+        conda_lock.lock(
+            micromamba=True,
+            conda=str(micromamba),
+            platform=get_conda_platform(),
+            f=str(abstract_conf_path),
+            lockfile=str(lock_path),
         )
+    except sh.ErrorReturnCode:
+        log.exception(
+            "Failed to build conda lock file from spec: %s", abstract_conf_path
+        )
+        return None
+    log.info("Installing conda packages into dir: %s", snap_dir)
+    try:
+        conda_lock.install(
+            str(lock_path), micromamba=True, conda=str(micromamba), prefix=str(snap_dir)
+        )
+    except sh.ErrorReturnCode:
+        log.exception("Failed to build conda snap: %s", snap_dir)
+        if snap_dir.exists():
+            rmtree(snap_dir)
+        # TODO: We should probably at least rename the lock file since we know it failed
+        #       to build? Don't want to delete it so we can debug...
+        return None
+    else:
+        # Generate activation scripts
+        for shell_type in ShellType:
+            if shell_type == ShellType.SH:
+                conda_sh = "bash"
+            elif shell_type == ShellType.CSH:
+                conda_sh = "tcsh"
+            elif shell_type == ShellType.FISH:
+                conda_sh = "fish"
+            else:
+                raise NotImplementedError()
+            act_path = envs_dir / env_name / f"{snap_id}_activate.{shell_type.value}"
+            act_path.write_text(
+                micromamba.shell.activate(prefix=str(snap_dir), shell=conda_sh)
+            )
+    return SnapSpec.from_lock_path(lock_path)
+
+
+_CONDA_WRAP_SCRIPT = """\
+#!/bin/sh
+{micromamba} -r {root_prefix} -p {env_path} run {cmd} "$@"
+"""
+
+
+def update_conda_app(
+    app_name: str,
+    app_config: CondaAppConfig,
+    conda_lock: sh.Command,
+    micromamba: sh.Command,
+    locs: Dict[str, Path],
+    snap_id: SnapId,
+) -> SnapSpec:
+    """Create updated snapshot of isolated Conda app"""
+    env_snap = update_conda_env(
+        app_name, app_config.conda, conda_lock, micromamba, locs, snap_id
     )
-    conda_cmd = get_micromamba(path_locs).bake(
-        rc_file=str(conda_conf), root_prefix=conda_dir
-    )
-    for env_name, env_info in conda_info.get("envs", {}).items():
-        env_info = deepcopy(env_info)
-        snap_name = f"{env_name}-{update_ts}"
-        update_conda_env(conda_cmd, snap_name, env_info)
+    if env_snap is None:
+        return None
+    app_dir = locs["apps"] / "conda" / app_name / str(snap_id)
+    meta_dir = env_snap.snap_dir / "conda-meta"
+    log.debug("Looking for package meta-data under: %s", meta_dir)
+    export_filt = app_config.exported
+    if export_filt is None:
+        export_filt = {".*": ".*"}
+    export_filt = {re.compile(k): re.compile(v) for k, v in export_filt.items()}
+    app_dir.mkdir(parents=True)
+    for spec in app_config.conda.specs:
+        pkg_name = re.match("([^\s<>=~!]+).*", spec).groups()[0]
+        file_expr = None
+        for pkg_expr, fexpr in export_filt.items():
+            if re.match(pkg_expr, pkg_name):
+                file_expr = fexpr
+                break
+        else:
+            log.debug("Not exporting from package: %s", pkg_name)
+            continue
+        for meta_path in meta_dir.glob(f"{pkg_name}-*"):
+            log.debug("Checking package meta: %s", meta_path)
+            if not re.match(f"{pkg_name}-[0-9].*", meta_path.name):
+                continue
+            log.debug("Reading package meta: %s", meta_path)
+            pkg_meta = json.loads(meta_path.read_text())
+            for pkg_file in pkg_meta["files"]:
+                if pkg_file.startswith("man/") and re.match(file_expr, pkg_file[4:]):
+                    pkg_file = Path(pkg_file)
+                    app_file = app_dir / pkg_file
+                    app_file.parent.mkdir(exist_ok=True, parents=True)
+                    tgt = os.path.relpath(env_snap.snap_dir / pkg_file, app_file.parent)
+                    log.debug("Symlinking %s -> %s", app_file, tgt)
+                    app_file.symlink_to(tgt)
+                elif pkg_file.startswith("bin/") and re.match(file_expr, pkg_file[4:]):
+                    pkg_file = Path(pkg_file)
+                    app_file = app_dir / pkg_file
+                    log.debug("Making wrapper %s -> %s", app_file, pkg_file)
+                    app_file.parent.mkdir(exist_ok=True, parents=True)
+                    app_file.write_text(
+                        _CONDA_WRAP_SCRIPT.format(
+                            root_prefix=locs["conda"],
+                            micromamba=str(micromamba),
+                            env_path=env_snap.snap_dir,
+                            cmd=pkg_file.name,
+                        )
+                    )
+                    app_file.chmod(app_file.stat().st_mode | 0o000550)
+    # Link to lock file
+    lock_path = locs["apps"] / "conda" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.CONDA]}"
+    lock_path.symlink_to(os.path.relpath(env_snap.lock_file, lock_path.parent))
+    # Make app activation scripts
+    app_snap = SnapSpec.from_lock_path(lock_path)
+    for shell_type in ShellType:
+        act_path = app_snap.get_activate_path(shell_type)
+        act_path.write_text(make_app_act_script(app_dir, shell_type))
+    return app_snap
