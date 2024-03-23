@@ -193,7 +193,6 @@ class ByoeRepo:
             if "comment" in def_gpg:
                 kwargs["comment"] = def_gpg["comment"]
             spack.gpg.create(def_gpg["name"], def_gpg["email"], **kwargs)
-            self._locs["spack_cache"].mkdir()
             spack.gpg.export(self._locs["spack_cache"] / "gpg.pub")
         # TODO: At least for HTTP mirrors we can run "spack buildcache keys --install --trust"
         #       need to look into how to handle other GPG keys
