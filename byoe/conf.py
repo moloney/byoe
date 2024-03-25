@@ -2,7 +2,7 @@ import os, logging, typing
 from pathlib import Path
 from enum import Enum
 from copy import deepcopy
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from typing import ClassVar, Dict, List, Optional, Union, Any
@@ -79,9 +79,9 @@ class Config:
                 res[attr] = val
         return res
 
-    def set_defaults(self, def_config: "Config") -> None:
-        for field in fields(def_config):
-            new_def_val = getattr(def_config, field.name)
+    def set_defaults(self, def_config: Dict[str, Any]) -> None:
+        for field in fields(self):
+            new_def_val = def_config[field.name]
             if field.name not in self._explicitly_set:
                 setattr(self, field.name, new_def_val)
             elif new_def_val != field.default:
@@ -299,9 +299,7 @@ class EnvConfig(IncludableConfig):
         if self.spack is not None and self.conda is not None:
             raise InvalidConfigError("Can't mix spack / conda in same environment")
 
-    def set_defaults(
-        self, defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
-    ) -> None:
+    def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         for attr in ("spack", "python", "conda"):
             if getattr(self, attr) and attr in defaults:
                 getattr(self, attr).set_defaults(defaults[attr])
@@ -317,9 +315,7 @@ class CondaAppConfig(IncludableConfig):
 
     default: bool = True
 
-    def set_defaults(
-        self, defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
-    ) -> None:
+    def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         if "conda" in defaults:
             self.conda.set_defaults[defaults["conda"]]
 
@@ -336,9 +332,7 @@ class PythonAppConfig(IncludableConfig):
 
     default: bool = True
 
-    def set_defaults(
-        self, defaults: Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]
-    ) -> None:
+    def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         for attr in ("spack", "python"):
             if getattr(self, attr) and attr in defaults:
                 getattr(self, attr).set_defaults[defaults[attr]]
@@ -407,7 +401,7 @@ def get_job_build_info(build_config: Optional[BuildConfig], job_type: str):
         else:
             slurm_conf = build_config.slurm_config
         slurm_info = deepcopy(slurm_conf.get(job_type, SlurmBuildConfig()))
-        slurm_info.set_defaults(slurm_conf.get("default", SlurmBuildConfig()))
+        slurm_info.set_defaults(slurm_conf.get("default", asdict(SlurmBuildConfig())))
         if slurm_info.tasks_per_job is None:
             slurm_info.tasks_per_job = DEFAULT_SLURM_TASKS
         if slurm_info.tmp_dir is None:
@@ -464,7 +458,7 @@ class SiteConfig(Config):
 
     build_opts: BuildConfig = field(default_factory=BuildConfig)
 
-    defaults: Optional[Dict[str, Union[SpackConfig, PythonConfig, CondaConfig]]] = None
+    defaults: Optional[Dict[str, Dict[str, Any]]] = None
 
     apps: Optional[Dict[str, Union[CondaAppConfig, PythonAppConfig]]] = None
 
@@ -502,21 +496,6 @@ class SiteConfig(Config):
         build_opts = conf_data.get("build_opts")
         if build_opts:
             conf_data["build_opts"] = BuildConfig.from_dict(build_opts)
-        defaults = conf_data.get("defaults")
-        if defaults:
-            conf_data["defaults"] = {}
-            for env_type, env_defaults in defaults.items():
-                if env_type == "spack":
-                    def_conf = SpackConfig.from_dict(env_defaults)
-                elif env_type == "python":
-                    def_conf = PythonConfig.from_dict(env_defaults)
-                elif env_type == "conda":
-                    def_conf = CondaConfig.from_dict(env_defaults)
-                else:
-                    raise InvalidConfigError(
-                        f"Invalid config type under 'defaults': {env_type}"
-                    )
-                conf_data["defaults"][env_type] = def_conf
         apps = conf_data.get("apps")
         if apps:
             converted = {}
