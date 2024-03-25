@@ -189,7 +189,6 @@ class IncludableConfig(Config):
 
     base_dir: ClassVar[Optional[Path]] = None
 
-
     @classmethod
     def filt_include(cls, include_data):
         """Subclasses can override this method to modify / filter included data"""
@@ -204,7 +203,9 @@ class IncludableConfig(Config):
             include_data = {}
             for include in includes:
                 include_data.update(
-                    cls.filt_include(yaml.safe_load(_get_conf_content(cls.base_dir, include)))
+                    cls.filt_include(
+                        yaml.safe_load(_get_conf_content(cls.base_dir, include))
+                    )
                 )
             include_data.update(conf_data)
             conf_data = include_data
@@ -237,6 +238,7 @@ class IncludableConfig(Config):
 @dataclass
 class SpackBuildChain(Config):
     """Spack build-chain specification"""
+
     compiler: Optional[str] = None
 
     binutils: Optional[str] = None
@@ -258,7 +260,7 @@ class SpackConfig(IncludableConfig):
 @dataclass
 class PythonConfig(IncludableConfig):
     """Python specific configuration for an environment"""
-    
+
     specs: List[str]
 
     system_packages: bool = True
@@ -375,7 +377,7 @@ class BuildConfig(Config):
             if val is None:
                 continue
             if field.name == "slurm_config":
-                res[field.name] = {k : v.to_dict() for k, v in val.items()}
+                res[field.name] = {k: v.to_dict() for k, v in val.items()}
             else:
                 res[field.name] = val.to_dict()
         return res
@@ -440,12 +442,13 @@ class GlobalSpackConfig(Config):
 @dataclass
 class GlobalCondaConfig(Config):
     """Conda config that is handled globally"""
+
     source: str = "https://micro.mamba.pm/api/micromamba"
 
     build_chain: Optional[SpackBuildChain] = None
 
     def __post_init__(self):
-        if self.source != "spack" and self. build_chain is not None:
+        if self.source != "spack" and self.build_chain is not None:
             raise InvalidConfigError(
                 "Specifying 'build_chain' only valid if 'source' is 'spack'"
             )
@@ -483,7 +486,7 @@ class SiteConfig(Config):
             if val is None:
                 continue
             if field.name in ("defaults", "apps", "envs"):
-                res[field.name] = {k : v.to_dict() for k, v in val.items()}
+                res[field.name] = {k: v.to_dict() for k, v in val.items()}
             else:
                 res[field.name] = val.to_dict()
         return res
@@ -499,6 +502,21 @@ class SiteConfig(Config):
         build_opts = conf_data.get("build_opts")
         if build_opts:
             conf_data["build_opts"] = BuildConfig.from_dict(build_opts)
+        defaults = conf_data.get("defaults")
+        if defaults:
+            conf_data["defaults"] = {}
+            for env_type, env_defaults in defaults.items():
+                if env_type == "spack":
+                    def_conf = SpackConfig.from_dict(env_defaults)
+                elif env_type == "python":
+                    def_conf = PythonConfig.from_dict(env_defaults)
+                elif env_type == "conda":
+                    def_conf = CondaConfig.from_dict(env_defaults)
+                else:
+                    raise InvalidConfigError(
+                        f"Invalid config type under 'defaults': {env_type}"
+                    )
+                conf_data["defaults"][env_type] = def_conf
         apps = conf_data.get("apps")
         if apps:
             converted = {}
