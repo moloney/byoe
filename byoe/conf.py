@@ -302,7 +302,7 @@ class EnvConfig(IncludableConfig):
     ) -> None:
         for attr in ("spack", "python", "conda"):
             if getattr(self, attr) and attr in defaults:
-                getattr(self, attr).set_defaults[defaults[attr]]
+                getattr(self, attr).set_defaults(defaults[attr])
 
 
 @dataclass
@@ -367,6 +367,18 @@ class BuildConfig(Config):
     tmp_dir: Optional[Path] = None
 
     slurm_config: Optional[Dict[str, SlurmBuildConfig]] = None
+
+    def to_dict(self):
+        res = {}
+        for field in fields(self):
+            val = getattr(self, field.name)
+            if val is None:
+                continue
+            if field.name == "slurm_config":
+                res[field.name] = {k : v.to_dict() for k, v in val.items()}
+            else:
+                res[field.name] = val.to_dict()
+        return res
 
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
