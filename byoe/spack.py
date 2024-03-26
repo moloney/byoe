@@ -341,7 +341,7 @@ def update_spack_env(
     spack_install = get_spack_install(
         spack_env, locs["tmp"], str(snap_id), build_config=build_config
     )
-    spack_concretize = get_spack_concretize(spack_env, build_config)
+    spack_concretize = get_spack_concretize(spack_env, build_config=build_config)
     spack_push = get_spack_push(spack_env, build_config)
     lock_path = spack_envs_dir / env_name / f"{snap_id}.lock"
     success = True
