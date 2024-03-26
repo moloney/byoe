@@ -155,7 +155,10 @@ def get_compilers(spack):
 def _update_compiler_conf(compiler_conf: Path, binutils_path: Path):
     """Update spack compiler config to prepend binutils_path to PATH"""
     data = yaml.safe_load(compiler_conf.open())
-    for comp_info in data["compilers"]:
+    comp_data = data.get("compilers")
+    if comp_data is None:
+        comp_data = data["spack"]["compilers"]
+    for comp_info in comp_data:
         comp_env = comp_info["compiler"]["environment"]
         if "prepend_path" not in comp_env:
             comp_env["prepend_path"] = {"PATH": str(binutils_path / "bin")}
@@ -165,6 +168,7 @@ def _update_compiler_conf(compiler_conf: Path, binutils_path: Path):
 def setup_build_chains(
     spack: sh.Command,
     spack_install: sh.Command,
+    spack_comp_find: sh.Command,
     buildchains: List[SpackBuildChain],
     conf_path: Path,
     conf_scope: str,
@@ -187,7 +191,7 @@ def setup_build_chains(
                     missing_build_deps.add(compiler)
                 else:
                     comp_loc = spack.location(first=True, i=compiler).strip()
-                    spack.compiler.find("--scope", conf_scope, comp_loc)
+                    spack_comp_find("--scope", conf_scope, comp_loc)
         if bc.binutils is not None:
             binutils = bc.binutils
             if bc.compiler is None:
@@ -214,7 +218,7 @@ def setup_build_chains(
         for bc in buildchains:
             if bc.compiler in missing_build_deps:
                 comp_loc = spack.location(first=True, i=bc.compiler).strip()
-                spack.compiler.find("--scope", conf_scope, comp_loc)
+                spack_comp_find("--scope", conf_scope, comp_loc)
                 binutils_path = Path(spack.location(first=True, i=bc.binutils).strip())
                 _update_compiler_conf(conf_path, binutils_path)
 
@@ -223,6 +227,7 @@ def _prep_spack_build(
     env_dir: Path,
     snap_path: Path,
     spack: sh.Command,
+    spack_env: sh.Command,
     spack_config: SpackConfig,
     build_config: BuildConfig,
     base_tmp: Path,
@@ -254,6 +259,7 @@ def _prep_spack_build(
         setup_build_chains(
             spack,
             spack_install,
+            spack_env.compiler.find,
             spack_config.build_chains,
             env_dir / "spack.yaml",
             f"env:{env_dir}",
@@ -261,7 +267,7 @@ def _prep_spack_build(
     # Setup any externals for the env
     if spack_config.externals:
         for external in spack_config.externals:
-            spack.external.find("--scope", f"env:{env_dir}", external)
+            spack_env.external.find("--scope", f"env:{env_dir}", external)
 
 
 def _update_spack_env(
@@ -323,16 +329,17 @@ def update_spack_env(
     log.info("Updating spack snap: %s", snap_path)
     try:
         _prep_spack_build(
-            env_dir, snap_path, spack_env, spack_config, build_config, locs["tmp"]
+            env_dir, snap_path, spack, spack_env, spack_config, build_config, locs["tmp"]
         )
     except:
         log.exception("Error preparing spack environment: %s", env_dir)
-        if env_dir.exists():
-            shutil.rmtree(env_dir)
+        # TODO:
+        #if env_dir.exists():
+        #    shutil.rmtree(env_dir)
         return None
     # Prepare spack concretize/install/push commands for the environment
     spack_install = get_spack_install(
-        spack_env, locs["tmp"], str(snap_id), build_config
+        spack_env, locs["tmp"], str(snap_id), build_config=build_config
     )
     spack_concretize = get_spack_concretize(spack_env, build_config)
     spack_push = get_spack_push(spack_env, build_config)
@@ -354,8 +361,9 @@ def update_spack_env(
     except sh.ErrorReturnCode:
         log.exception("Error while updating spack buildcache index")
     if not success:
-        if env_dir.exists():
-            shutil.rmtree(env_dir)
+        # TODO:
+        #if env_dir.exists():
+        #    shutil.rmtree(env_dir)
         return None
     return SnapSpec.from_lock_path(lock_path)
 

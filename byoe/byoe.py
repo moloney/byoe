@@ -337,6 +337,7 @@ class ByoeRepo:
                     setup_build_chains(
                         spack,
                         spack_install,
+                        spack.compiler.find,
                         [config.build_chain],
                         self._locs["spack"] / "etc" / "spack" / "compilers.yaml",
                         "site",

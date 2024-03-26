@@ -81,15 +81,20 @@ class Config:
 
     def set_defaults(self, def_config: Dict[str, Any]) -> None:
         for field in fields(self):
+            if field.name not in def_config:
+                continue
             new_def_val = def_config[field.name]
-            if field.name not in self._explicitly_set:
+            if (
+                not hasattr(self, "_explicitly_set")
+                or field.name not in self._explicitly_set
+            ):
                 setattr(self, field.name, new_def_val)
             elif new_def_val != field.default:
                 prev_val = getattr(self, field.name)
                 if isinstance(new_def_val, list):
                     if prev_val is None:
                         prev_val = []
-                    setattr(self, prev_val + new_def_val)
+                    setattr(self, field.name, prev_val + new_def_val)
                 elif isinstance(new_def_val, dict):
                     if prev_val is None:
                         prev_val = {}
@@ -256,6 +261,39 @@ class SpackConfig(IncludableConfig):
 
     specs: Optional[List[str]] = None
 
+    def to_dict(self):
+        res = {}
+        for field in fields(self):
+            val = getattr(self, field.name)
+            if val is None:
+                continue
+            if field.name == "build_chains":
+                res[field.name] = [v.to_dict() for v in val]
+            elif hasattr(val, "to_dict"):
+                res[field.name] = val.to_dict()
+            else:
+                res[field.name] = val
+        return res
+
+    @classmethod
+    def from_dict(cls, conf_data: Dict[str, Any]):
+        build_chains = conf_data.get("build_chains")
+        if build_chains:
+            conf_data["build_chains"] = [
+                SpackBuildChain.from_dict(x) for x in build_chains
+            ]
+        res = cls(**conf_data)
+        res._explicitly_set = set(conf_data.keys())
+        return res
+
+    def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
+        build_chains = defaults.get("build_chains")
+        if build_chains:
+            defaults["build_chains"] = [
+                SpackBuildChain.from_dict(x) for x in build_chains
+            ]
+        super().set_defaults(defaults)
+
 
 @dataclass
 class PythonConfig(IncludableConfig):
@@ -317,7 +355,7 @@ class CondaAppConfig(IncludableConfig):
 
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         if "conda" in defaults:
-            self.conda.set_defaults[defaults["conda"]]
+            self.conda.set_defaults(defaults["conda"])
 
 
 @dataclass
@@ -335,7 +373,7 @@ class PythonAppConfig(IncludableConfig):
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         for attr in ("spack", "python"):
             if getattr(self, attr) and attr in defaults:
-                getattr(self, attr).set_defaults[defaults[attr]]
+                getattr(self, attr).set_defaults(defaults[attr])
 
 
 @dataclass
@@ -370,10 +408,12 @@ class BuildConfig(Config):
             val = getattr(self, field.name)
             if val is None:
                 continue
+            if field.name == "tmp_dir":
+                res[field.name] = str(val)
             if field.name == "slurm_config":
                 res[field.name] = {k: v.to_dict() for k, v in val.items()}
             else:
-                res[field.name] = val.to_dict()
+                res[field.name] = val
         return res
 
     @classmethod
@@ -479,10 +519,12 @@ class SiteConfig(Config):
             val = getattr(self, field.name)
             if val is None:
                 continue
-            if field.name in ("defaults", "apps", "envs"):
+            if field.name in ("apps", "envs"):
                 res[field.name] = {k: v.to_dict() for k, v in val.items()}
-            else:
+            elif field.name != "defaults":
                 res[field.name] = val.to_dict()
+            else:
+                res[field.name] = val
         return res
 
     @classmethod
