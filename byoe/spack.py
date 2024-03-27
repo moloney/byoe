@@ -1,5 +1,6 @@
 """Manage / build spack environments"""
 
+import json
 import os, logging, shutil
 from datetime import datetime
 from pathlib import Path
@@ -121,7 +122,11 @@ def get_spack_push(
     """Get preconfigured 'spack buildcache push' command"""
     if build_config is None:
         build_config = BuildConfig()
-    push_args = ["default"]
+    # We have to manually build spec list, otherwise trying to push a partial 
+    # environment will fail
+    installed = json.loads(spack.find(json=True))
+    specs = [f"{x['name']}@{x['version']}" for x in installed]
+    push_args = ["default"] + specs
     return par_spack(
         spack.buildcache.push, push_args, get_job_build_info(build_config, "spack_push")
     )
@@ -294,8 +299,6 @@ def _update_spack_env(
     except Exception as e:
         install_err = e
         log.exception("Error building spack snapshot: %s", snap_path)
-        if snap_path.exists():
-            shutil.rmtree(snap_path)
     else:
         log.info(
             "Finished spack snapshot: %s (took %s)", snap_path, (datetime.now() - start)
@@ -306,6 +309,8 @@ def _update_spack_env(
     except:
         log.exception("Error while pushing to spack buildcache")
     if install_err is not None:
+        if snap_path.exists():
+            shutil.rmtree(snap_path)
         raise install_err
     for sh_type in ("sh", "csh", "fish"):
         act_script = spack.env.activate(f"--{sh_type}", "-d", str(env_dir))
