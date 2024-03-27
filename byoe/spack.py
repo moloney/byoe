@@ -204,6 +204,9 @@ def setup_build_chains(
                 #       we can't build environments in parallel. Need to see if we can
                 #       override the system config of a compiler with and environment config.
                 raise ValueError("Can't set non-system binutils for system compiler")
+            # TODO: I guess that enabling the assembler here should be an option, not
+            #       sure why it's not the default in spack...
+            binutils = f"{binutils} +gas"
             try:
                 spack.find(binutils)
             except sh.ErrorReturnCode:
