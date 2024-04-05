@@ -157,7 +157,11 @@ def spack(ctx: typer.Context):
     generally avoid commands that update configuration.
     """
     repo = ByoeRepo(conf_data["user"].base_dir)
-    spack_cmd = repo.get_spack().bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
+    if repo._locs["spack"].exists():
+        spack_cmd = repo._get_spack()
+    else:
+        spack_cmd = repo.get_spack()
+    spack_cmd = spack_cmd.bake(_in=sys.stdin, _out=sys.stdout, _err=sys.stderr)
     try:
         spack_cmd(ctx.args)
     except sh.ErrorReturnCode as e:
