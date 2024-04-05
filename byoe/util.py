@@ -38,12 +38,16 @@ def select_snap(
         raise ValueError("Update periods under 12 months must evenly divide 12")
     tgt_month = now.month - ((now.month - 1) % period)
     tgt = datetime(now.year, tgt_month, 1)
+    by_delta = {}
     min_delta = min_idx = None
-    for snap_idx, snap_id in enumerate(snap_ids):
+    for snap_id in snap_ids:
         delta = snap_id.time_stamp - tgt
+        if delta not in by_delta:
+            by_delta[delta] = []
+        by_delta[delta].append(snap_id)
         if min_delta is None or delta < min_delta:
-            min_delta, min_idx = delta, snap_idx
-    return snap_ids[min_idx]
+            min_delta = delta
+    return sorted(by_delta[min_delta])[-1]
 
 
 def get_closest_snap(
