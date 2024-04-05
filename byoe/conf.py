@@ -212,6 +212,7 @@ class IncludableConfig(Config):
                         yaml.safe_load(_get_conf_content(cls.base_dir, include))
                     )
                 )
+            del conf_data["include"]
             include_data.update(conf_data)
             conf_data = include_data
         for attr, hint in typing.get_type_hints(cls).items():
@@ -289,6 +290,7 @@ class SpackConfig(IncludableConfig):
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         build_chains = defaults.get("build_chains")
         if build_chains:
+            defaults = deepcopy(defaults)
             defaults["build_chains"] = [
                 SpackBuildChain.from_dict(x) for x in build_chains
             ]
@@ -308,15 +310,17 @@ class PythonConfig(IncludableConfig):
 class CondaConfig(IncludableConfig):
     """Conda specific configuration for an environment"""
 
-    channels: List[str]
+    channels: List[str] = field(default_factory=list)
 
-    specs: List[str]
+    specs: List[str] = field(default_factory=list)
 
     @classmethod
     def filt_include(cls, include_data):
-        for key in include_data:
-            if key not in ("channels", "specs", "dependencies"):
-                del include_data["key"]
+        needs_del = [
+            k for k in include_data if k not in ("channels", "specs", "dependencies")
+        ]
+        for key in needs_del:
+            del include_data[key]
         if "dependencies" in include_data:
             include_data["specs"] = include_data["dependencies"]
             del include_data["dependencies"]
@@ -332,6 +336,8 @@ class EnvConfig(IncludableConfig):
     python: Optional[PythonConfig] = None
 
     conda: Optional[CondaConfig] = None
+
+    extra_activation: Optional[List[str]] = None
 
     def __post_init__(self):
         if self.spack is not None and self.conda is not None:
@@ -349,9 +355,11 @@ class CondaAppConfig(IncludableConfig):
 
     conda: CondaConfig
 
-    exported: Optional[Dict[str, str]] = None
+    exported: Optional[Dict[str, Dict[str, str]]] = None
 
     default: bool = True
+
+    extra_activation: Optional[List[str]] = None
 
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         if "conda" in defaults:
@@ -369,6 +377,8 @@ class PythonAppConfig(IncludableConfig):
     spack: Optional[SpackConfig] = None
 
     default: bool = True
+
+    extra_activation: Optional[List[str]] = None
 
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         for attr in ("spack", "python"):
