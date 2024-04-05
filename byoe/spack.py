@@ -125,7 +125,7 @@ def get_spack_push(
     # We have to manually build spec list, otherwise trying to push a partial 
     # environment will fail
     installed = json.loads(spack.find(json=True))
-    specs = [f"{x['name']}@{x['version']}" for x in installed]
+    specs = [f"{x['name']}@{x['version']}/{x['hash']}" for x in installed]
     push_args = ["default"] + specs
     return par_spack(
         spack.buildcache.push, push_args, get_job_build_info(build_config, "spack_push")
