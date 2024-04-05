@@ -145,6 +145,7 @@ def update_conda_env(
 
 _CONDA_WRAP_SCRIPT = """\
 #!/bin/sh
+unset PYTHONPATH PYTHONHOME
 {micromamba} -r {root_prefix} -p {env_path} run {cmd} "$@"
 """
 
@@ -168,15 +169,18 @@ def update_conda_app(
     log.debug("Looking for package meta-data under: %s", meta_dir)
     export_filt = app_config.exported
     if export_filt is None:
-        export_filt = {".*": ".*"}
-    export_filt = {re.compile(k): re.compile(v) for k, v in export_filt.items()}
+        export_filt = {".*": {"bin": ".*", "man": ".+"}}
+    export_filt = {
+        re.compile(k1): {re.compile(k2): re.compile(v2) for k2, v2 in v1.items()}
+        for k1, v1 in export_filt.items()
+    }
     app_dir.mkdir(parents=True)
     for spec in app_config.conda.specs:
         pkg_name = re.match("([^\s<>=~!]+).*", spec).groups()[0]
-        file_expr = None
-        for pkg_expr, fexpr in export_filt.items():
+        pkg_filt = None
+        for pkg_expr, pfilt in export_filt.items():
             if re.match(pkg_expr, pkg_name):
-                file_expr = fexpr
+                pkg_filt = pfilt
                 break
         else:
             log.debug("Not exporting from package: %s", pkg_name)
@@ -188,18 +192,26 @@ def update_conda_app(
             log.debug("Reading package meta: %s", meta_path)
             pkg_meta = json.loads(meta_path.read_text())
             for pkg_file in pkg_meta["files"]:
-                if pkg_file.startswith("man/") and re.match(file_expr, pkg_file[4:]):
-                    pkg_file = Path(pkg_file)
-                    app_file = app_dir / pkg_file
-                    app_file.parent.mkdir(exist_ok=True, parents=True)
-                    tgt = os.path.relpath(env_snap.snap_dir / pkg_file, app_file.parent)
-                    log.debug("Symlinking %s -> %s", app_file, tgt)
-                    app_file.symlink_to(tgt)
-                elif pkg_file.startswith("bin/") and re.match(file_expr, pkg_file[4:]):
-                    pkg_file = Path(pkg_file)
-                    app_file = app_dir / pkg_file
+                pkg_file_toks = pkg_file.split("/")
+                pkg_sub_dir = pkg_file_toks[0]
+                pkg_sub_path = "/".join(pkg_file_toks[1:])
+                file_expr = None
+                for sub_dir_expr, fexpr in pkg_filt.items():
+                    if re.match(sub_dir_expr, pkg_sub_dir):
+                        file_expr = fexpr
+                        break
+                else:
+                    continue
+                if not re.match(file_expr, pkg_sub_path):
+                    continue
+                pkg_file = Path(pkg_file)
+                app_file = app_dir / pkg_file
+                if app_file.exists():
+                    log.debug("Skipping already existing file: %s", app_file)
+                    continue
+                app_file.parent.mkdir(exist_ok=True, parents=True)
+                if pkg_sub_dir == "bin":
                     log.debug("Making wrapper %s -> %s", app_file, pkg_file)
-                    app_file.parent.mkdir(exist_ok=True, parents=True)
                     app_file.write_text(
                         _CONDA_WRAP_SCRIPT.format(
                             root_prefix=locs["conda"],
@@ -209,8 +221,14 @@ def update_conda_app(
                         )
                     )
                     app_file.chmod(app_file.stat().st_mode | 0o000550)
+                else:
+                    tgt = os.path.relpath(env_snap.snap_dir / pkg_file, app_file.parent)
+                    log.debug("Symlinking %s -> %s", app_file, tgt)
+                    app_file.symlink_to(tgt)
     # Link to lock file
-    lock_path = locs["apps"] / "conda" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.CONDA]}"
+    lock_path = (
+        locs["apps"] / "conda" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.CONDA]}"
+    )
     lock_path.symlink_to(os.path.relpath(env_snap.lock_file, lock_path.parent))
     # Make app activation scripts
     app_snap = SnapSpec.from_lock_path(lock_path)
