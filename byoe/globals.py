@@ -100,6 +100,12 @@ class SnapSpec:
 
     snap_type: SnapType
 
+    def __lt__(self, other: "SnapSpec"):
+        return (self.name, self.snap_id) < (other.name, other.snap_id)
+    
+    def __str__(self) -> str:
+        return f"{self.env_type.name}/{self.snap_name}"
+
     @property
     def snap_name(self) -> str:
         return f"{self.name}@{self.snap_id}"
@@ -139,6 +145,3 @@ class SnapSpec:
         if lock_path.parent.parent.parent.name == "apps":
             snap_type = SnapType.APP
         return cls(snap_id, env_type, name, lock_path.parent / str(snap_id), snap_type)
-
-    def __lt__(self, other: "SnapSpec"):
-        return self.snap_name < other.snap_name
