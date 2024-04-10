@@ -1,7 +1,8 @@
-import os, shlex, json
+import os, shlex, json, logging
 from datetime import datetime
 from pathlib import Path
 from io import TextIOWrapper
+from difflib import unified_diff
 from typing import List, Dict, Optional, Tuple, Union
 
 import sh
@@ -20,9 +21,12 @@ except sh.CommandNotFound:
     HAS_SLURM = False
 
 
+log = logging.getLogger(__name__)
+
+
 def select_snap(
     snap_ids: List[SnapId], period: int, now: Optional[datetime] = None
-) -> datetime:
+) -> SnapId:
     """Select snapshot date base on the `period` (and `now`)"""
     if now is None:
         now = datetime.now()
@@ -32,16 +36,16 @@ def select_snap(
                 "Update periods over 12 months must be evenly divisible by 12"
             )
         period_yrs = period // 12
-        tgt_year = now.year - (now.year % period_yrs)
-        return datetime(tgt_year)
-    if 12 % period != 0:
-        raise ValueError("Update periods under 12 months must evenly divide 12")
-    tgt_month = now.month - ((now.month - 1) % period)
-    tgt = datetime(now.year, tgt_month, 1)
+        tgt = datetime(now.year - (now.year % period_yrs), 1, 1)
+    else:
+        if 12 % period != 0:
+            raise ValueError("Update periods under 12 months must evenly divide 12")
+        tgt = datetime(now.year, now.month - ((now.month - 1) % period), 1)
     by_delta = {}
-    min_delta = min_idx = None
+    min_delta = None
+    log.debug("Target date is %s Selecting from snap_ids: %s", tgt, snap_ids)
     for snap_id in snap_ids:
-        delta = snap_id.time_stamp - tgt
+        delta = abs(snap_id.time_stamp - tgt)
         if delta not in by_delta:
             by_delta[delta] = []
         by_delta[delta].append(snap_id)
@@ -171,3 +175,37 @@ def make_app_act_script(snap_dir: Path, shell_type: ShellType) -> str:
         )
     else:
         raise NotImplementedError
+
+
+def diff_env(pre_env, post_env):
+    res = {}
+    res["new"] = {k: v for k, v in post_env.items() if k not in pre_env}
+    res["del"] = {k: v for k, v in pre_env.items() if k not in post_env}
+    res["pre"] = {}
+    for k, pre_v in pre_env.items():
+        post_v = post_env.get(k)
+        if post_v is None:
+            continue
+        pre_toks = pre_v.split(os.pathsep)
+        post_toks = post_v.split(os.pathsep)
+        curr_seq = []
+        before = ""
+        post_idx = 0
+        res["pre"][k] = {}
+        for pre_tok in pre_toks:
+            post_tok = post_toks[post_idx]
+            if pre_tok != post_tok:
+                curr_seq.append(pre_tok)
+                continue
+            else:
+                #if curr_seq:
+                # TODO: A path could appear mutiple times in the sequence, although it
+                #       is semantically equivalent to delete/ignore those
+                res["pre"][k][post_tok] = curr_seq
+    return res
+
+def restore_env(post_env, env_diff):
+    for k in env_diff["new"]:
+        del post_env[k]
+    for k, old_v in env_diff["del"].items():
+        post_env[k] = old_v
