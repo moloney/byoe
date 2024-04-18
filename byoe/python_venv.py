@@ -76,7 +76,7 @@ def update_python_env(
         pip_compile(
             main_req_path,
             output_file=str(lock_path),
-            generate_hashes=True,
+            generate_hashes=python_config.generate_hashes,
             allow_unsafe=True,
             verbose=True,
         )

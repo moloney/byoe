@@ -306,6 +306,9 @@ class PythonConfig(IncludableConfig):
 
     system_packages: bool = True
 
+    #TODO: Maybe enable by default after this: https://github.com/pypa/pip/pull/11968
+    generate_hashes: bool = False
+
 
 @dataclass
 class CondaConfig(IncludableConfig):
