@@ -8,7 +8,7 @@ import sh
 from .globals import ShellType, SnapId, SnapSpec
 from .util import get_env_cmd, get_activated_envrion, make_app_act_script
 from .conf import PythonConfig
-from .spack import get_spack_env_cmds
+from .spack import get_spack_env_cmds, unset_implicit_pypath
 
 
 log = logging.getLogger(__name__)
@@ -24,10 +24,11 @@ def get_venv_cmds(
 ) -> List[sh.Command]:
     """Get a command inside spack env / python venv"""
     act_scripts = [
-        (spack_env.parent / f"{spack_env.name}_activate.sh").read_text(),
+        (spack_env.parent / f"{spack_env.name}-activate.sh").read_text(),
         (py_venv / "bin" / "activate").read_text(),
     ]
     act_env = get_activated_envrion(act_scripts)
+    unset_implicit_pypath(spack_env, act_env)
     env_bin = py_venv / "bin"
     return [get_env_cmd(env_bin / cmd, act_env, log_file=log_file) for cmd in cmds]
 

@@ -370,10 +370,22 @@ def update_spack_env(
         log.exception("Error while updating spack buildcache index")
     if not success:
         # TODO:
-        #if env_dir.exists():
+        # if env_dir.exists():
         #    shutil.rmtree(env_dir)
         return None
     return SnapSpec.from_lock_path(lock_path)
+
+
+def unset_implicit_pypath(spack_env: Path, act_env: Dict[str, str]) -> None:
+    # It seems like spack sets PYTHONPATH  when not needed, which screws up layering of
+    # virtual envs. Unset it here with some sanity checks that only the implicit 
+    # "site-packages" dir is included before we get rid of it
+    py_path = act_env.get("PYTHONPATH")
+    if py_path:
+        py_paths = py_path.split(os.pathsep)
+        if len(py_paths) != 1 or not py_paths[0].startswith(str(spack_env / "lib")):
+            log.warning("Unsetting PYTHONPATH with unexcpected components: %s", py_path)
+        del act_env["PYTHONPATH"]
 
 
 def get_spack_env_cmds(
@@ -383,8 +395,9 @@ def get_spack_env_cmds(
     log_file: Optional[TextIOWrapper] = None,
 ) -> List[sh.Command]:
     """Get sh.Command referencing a command in the given environment"""
-    act_path = spack_env.parent / f"{spack_env.name}_activate.sh"
+    act_path = spack_env.parent / f"{spack_env.name}-activate.sh"
     act_env = get_activated_envrion([act_path.read_text()], base_env)
+    unset_implicit_pypath(spack_env, act_env)
     env_bin = spack_env / "bin"
     return [get_env_cmd(env_bin / cmd, act_env, log_file) for cmd in cmds]
 

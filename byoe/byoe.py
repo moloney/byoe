@@ -606,11 +606,14 @@ class ByoeRepo:
                 if snap.env_type == EnvType.PYTHON:
                     res.append("VIRTUAL_ENV_DISABLE_PROMPT=1")
                 res.append(snap.get_activate_path(shell_type).read_text())
+                if snap.env_type == EnvType.SPACK:
+                    # TODO: this is hacky
+                    res.append("unset PYTHONPATH")
             extra_act = snap_conf["envs"][env_name].get("extra_activation")
             if extra_act:
                 res.append(f"# BYOE: Extra activation for '{env_name}' env")
                 res.append("\n".join(extra_act))
-        # Load apps first
+        # Load apps
         for app_name in enable:
             app_snaps = get_closest_snap(
                 snap_id, self.get_snaps(SnapType.APP, app_name, exists_only=False)
