@@ -1,3 +1,4 @@
+import re
 import os, logging, typing
 from pathlib import Path
 from enum import Enum
@@ -517,6 +518,9 @@ class SiteConfig(Config):
     def __post_init__(self):
         app_names = set() if self.apps is None else set(self.apps.keys())
         env_names = set() if self.envs is None else set(self.envs.keys())
+        for name in app_names | env_names:
+            if not re.match("[a-zA-Z0-9_]+", name):
+                raise InvalidConfigError(f"Invalid env/app name: {name}")
         collisions = app_names & env_names
         if collisions:
             raise InvalidConfigError(
