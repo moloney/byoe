@@ -239,3 +239,23 @@ def activate(
 @cli.command(rich_help_panel="User Commands")
 def status(short: bool = False):
     """Print info about any currently activated environment or apps"""
+    snap_id = os.environ.get("BYOE_SNAP_ID")
+    envs = os.environ.get("BYOE_ENVS")
+    apps = os.environ.get("BYOE_APPS")
+    if not snap_id:
+        return
+    if short:
+        if envs:
+            print(envs.split(os.pathsep)[0].split("/")[-1])
+        else:
+            print(f"_apps_only_@{snap_id}")
+    else:
+        print(f"Snap ID: {snap_id}")
+        if envs:
+            print("Environment layers:")
+            for env_layer in envs.split(os.pathsep):
+                print(f"\t{env_layer}")
+        if apps:
+            print("Apps:")
+            for app in apps.split(os.pathsep):
+                print(f"\t{app}")
