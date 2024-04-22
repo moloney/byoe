@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Any
 import sh
 
 from .globals import ShellType, SnapId, SnapSpec
-from .util import get_env_cmd, get_activated_envrion, make_app_act_script
+from .util import get_env_cmd, get_activated_envrion, make_app_act_script, stash_failed
 from .conf import PythonConfig
 from .spack import get_spack_env_cmds, unset_implicit_pypath
 
@@ -42,7 +42,7 @@ def update_python_env(
     locs: Dict[str, Path],
     snap_id: SnapId,
     log_file: Optional[TextIOWrapper] = None,
-) -> SnapSpec:
+) -> Optional[SnapSpec]:
     wheels_dir = locs["python_cache"]
     wheels_dir.mkdir(parents=True, exist_ok=True)
     snap_path = locs["envs"] / "python" / env_name / str(snap_id)
@@ -52,6 +52,7 @@ def update_python_env(
     sys_pkgs = python_config.system_packages
     log.debug("Creating venv: %s", snap_path)
     build_err: Optional[Exception] = None
+    sys_req_path = main_req_path = lock_path = None
     try:
         python("-m", "venv", snap_path, **kwargs)
         pip = get_venv_cmds(spack_snap.snap_dir, snap_path, ["pip"], log_file)[0]
@@ -64,8 +65,6 @@ def update_python_env(
             sys_req_path = locs["envs"] / "python" / env_name / f"{snap_id}-sys-req.txt"
             with open(sys_req_path, "wt") as out_f:
                 out_f.write(pip.list(format="freeze"))
-        else:
-            sys_req_path = None
         main_req_path = locs["envs"] / "python" / env_name / f"{snap_id}-main-req.in"
         with open(main_req_path, "wt") as out_f:
             if sys_req_path:
@@ -85,9 +84,7 @@ def update_python_env(
         pip_sync(str(lock_path), pip_args=f"--find-links {wheels_dir}")
     except Exception as e:
         build_err = e
-        log.error("Python venv update failed: %s", snap_path)
-        if snap_path.exists():
-            shutil.rmtree(snap_path)
+        log.exception("Python venv update failed: %s", snap_path)
     if snap_path.exists():
         log.debug("Updating python wheels dir")
         try:
@@ -95,6 +92,9 @@ def update_python_env(
         except:
             log.exception("Error while building wheels from env: %s", snap_path)
     if build_err is not None:
+        stash_failed(sys_req_path, main_req_path, lock_path)
+        if snap_path.exists():
+            shutil.rmtree(snap_path)
         return None
     return SnapSpec.from_lock_path(lock_path)
 
@@ -106,7 +106,7 @@ def update_python_app(
     python: sh.Command,
     locs: Dict[str, Path],
     snap_id: SnapId,
-) -> SnapSpec:
+) -> Optional[SnapSpec]:
     """Create updated snapshot of an isolated Python app"""
     snap_dir = locs["apps"] / "python" / app_name / str(snap_id)
     snap_dir.mkdir(parents=True)
@@ -126,8 +126,9 @@ def update_python_app(
     try:
         pipx.install(*python_config.specs, **kwargs)
     except Exception:
+        log.exception("Error building python app: %s", app_name)
         shutil.rmtree(snap_dir)
-        raise
+        return None
     pipx_venv_dir = snap_dir / "venvs" / app_name
     env_dir = locs["envs"] / "python" / app_name / str(snap_id)
     env_dir.parent.mkdir(exist_ok=True, parents=True)

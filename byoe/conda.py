@@ -3,13 +3,13 @@ import logging, io, tarfile, platform, requests, re
 import os
 from shutil import copyfileobj, rmtree
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import yaml
 import sh
 from sh import CommandNotFound
 
-from byoe.util import make_app_act_script
+from byoe.util import make_app_act_script, stash_failed
 
 sh = sh.bake(_tty_out=False)
 try:
@@ -84,11 +84,10 @@ def update_conda_env(
     micromamba: sh.Command,
     locs: Dict[str, Path],
     snap_id: SnapId,
-) -> SnapSpec:
+) -> Optional[SnapSpec]:
     """Create updated snapshot of a conda environment"""
     envs_dir = locs["envs"] / "conda"
     snap_dir = envs_dir / env_name / str(snap_id)
-    snap_dir.parent.mkdir(parents=True, exist_ok=True)
     conf_data = {}
     if not conda_config.channels:
         raise ValueError("No channels given for conda env '%s'", env_name)
@@ -96,22 +95,24 @@ def update_conda_env(
         raise ValueError("No specs given for conda env '%s'", env_name)
     conf_data["channels"] = conda_config.channels
     conf_data["dependencies"] = conda_config.specs
-    abstract_conf_path = envs_dir / env_name / f"{snap_id}-in.yml"
-    abstract_conf_path.write_text(yaml.dump(conf_data))
+    snap_dir.parent.mkdir(parents=True, exist_ok=True)
+    abstract_conf = envs_dir / env_name / f"{snap_id}-in.yml"
+    abstract_conf.write_text(yaml.dump(conf_data))
     lock_path = envs_dir / env_name / f"{snap_id}-lock.yml"
-    log.info("Running conda-lock on input: %s", abstract_conf_path)
+    log.info("Running conda-lock on input: %s", abstract_conf)
     try:
         conda_lock.lock(
             micromamba=True,
             conda=str(micromamba),
             platform=get_conda_platform(),
-            f=str(abstract_conf_path),
+            f=str(abstract_conf),
             lockfile=str(lock_path),
         )
     except sh.ErrorReturnCode:
         log.exception(
-            "Failed to build conda lock file from spec: %s", abstract_conf_path
+            "Failed to build conda lock file from spec: %s", abstract_conf
         )
+        stash_failed(abstract_conf)
         return None
     log.info("Installing conda packages into dir: %s", snap_dir)
     try:
@@ -120,10 +121,9 @@ def update_conda_env(
         )
     except sh.ErrorReturnCode:
         log.exception("Failed to build conda snap: %s", snap_dir)
+        stash_failed(abstract_conf, lock_path)
         if snap_dir.exists():
             rmtree(snap_dir)
-        # TODO: We should probably at least rename the lock file since we know it failed
-        #       to build? Don't want to delete it so we can debug...
         return None
     else:
         # Generate activation scripts
@@ -136,7 +136,7 @@ def update_conda_env(
                 conda_sh = "fish"
             else:
                 raise NotImplementedError()
-            act_path = envs_dir / env_name / f"{snap_id}_activate.{shell_type.value}"
+            act_path = envs_dir / env_name / f"{snap_id}-activate.{shell_type.value}"
             act_path.write_text(
                 micromamba.shell.activate(prefix=str(snap_dir), shell=conda_sh)
             )
@@ -157,7 +157,7 @@ def update_conda_app(
     micromamba: sh.Command,
     locs: Dict[str, Path],
     snap_id: SnapId,
-) -> SnapSpec:
+) -> Optional[SnapSpec]:
     """Create updated snapshot of isolated Conda app"""
     env_snap = update_conda_env(
         app_name, app_config.conda, conda_lock, micromamba, locs, snap_id
@@ -175,61 +175,67 @@ def update_conda_app(
         for k1, v1 in export_filt.items()
     }
     app_dir.mkdir(parents=True)
-    for spec in app_config.conda.specs:
-        pkg_name = re.match("([^\s<>=~!]+).*", spec).groups()[0]
-        pkg_filt = None
-        for pkg_expr, pfilt in export_filt.items():
-            if re.match(pkg_expr, pkg_name):
-                pkg_filt = pfilt
-                break
-        else:
-            log.debug("Not exporting from package: %s", pkg_name)
-            continue
-        for meta_path in meta_dir.glob(f"{pkg_name}-*"):
-            log.debug("Checking package meta: %s", meta_path)
-            if not re.match(f"{pkg_name}-[0-9].*", meta_path.name):
+    try:
+        for spec in app_config.conda.specs:
+            pkg_name = re.match("([^\s<>=~!]+).*", spec).groups()[0]
+            pkg_filt = None
+            for pkg_expr, pfilt in export_filt.items():
+                if re.match(pkg_expr, pkg_name):
+                    pkg_filt = pfilt
+                    break
+            else:
+                log.debug("Not exporting from package: %s", pkg_name)
                 continue
-            log.debug("Reading package meta: %s", meta_path)
-            pkg_meta = json.loads(meta_path.read_text())
-            for pkg_file in pkg_meta["files"]:
-                pkg_file_toks = pkg_file.split("/")
-                pkg_sub_dir = pkg_file_toks[0]
-                pkg_sub_path = "/".join(pkg_file_toks[1:])
-                file_expr = None
-                for sub_dir_expr, fexpr in pkg_filt.items():
-                    if re.match(sub_dir_expr, pkg_sub_dir):
-                        file_expr = fexpr
-                        break
-                else:
+            for meta_path in meta_dir.glob(f"{pkg_name}-*"):
+                log.debug("Checking package meta: %s", meta_path)
+                if not re.match(f"{pkg_name}-[0-9].*", meta_path.name):
                     continue
-                if not re.match(file_expr, pkg_sub_path):
-                    continue
-                pkg_file = Path(pkg_file)
-                app_file = app_dir / pkg_file
-                if app_file.exists():
-                    log.debug("Skipping already existing file: %s", app_file)
-                    continue
-                app_file.parent.mkdir(exist_ok=True, parents=True)
-                if pkg_sub_dir == "bin":
-                    log.debug("Making wrapper %s -> %s", app_file, pkg_file)
-                    app_file.write_text(
-                        _CONDA_WRAP_SCRIPT.format(
-                            root_prefix=locs["conda"],
-                            micromamba=str(micromamba),
-                            env_path=env_snap.snap_dir,
-                            cmd=pkg_file.name,
+                log.debug("Reading package meta: %s", meta_path)
+                pkg_meta = json.loads(meta_path.read_text())
+                for pkg_file in pkg_meta["files"]:
+                    pkg_file_toks = pkg_file.split("/")
+                    pkg_sub_dir = pkg_file_toks[0]
+                    pkg_sub_path = "/".join(pkg_file_toks[1:])
+                    file_expr = None
+                    for sub_dir_expr, fexpr in pkg_filt.items():
+                        if re.match(sub_dir_expr, pkg_sub_dir):
+                            file_expr = fexpr
+                            break
+                    else:
+                        continue
+                    if not re.match(file_expr, pkg_sub_path):
+                        continue
+                    pkg_file = Path(pkg_file)
+                    app_file = app_dir / pkg_file
+                    if app_file.exists():
+                        log.debug("Skipping already existing file: %s", app_file)
+                        continue
+                    app_file.parent.mkdir(exist_ok=True, parents=True)
+                    if pkg_sub_dir == "bin":
+                        log.debug("Making wrapper %s -> %s", app_file, pkg_file)
+                        app_file.write_text(
+                            _CONDA_WRAP_SCRIPT.format(
+                                root_prefix=locs["conda"],
+                                micromamba=str(micromamba),
+                                env_path=env_snap.snap_dir,
+                                cmd=pkg_file.name,
+                            )
                         )
-                    )
-                    app_file.chmod(app_file.stat().st_mode | 0o000550)
-                else:
-                    tgt = os.path.relpath(env_snap.snap_dir / pkg_file, app_file.parent)
-                    log.debug("Symlinking %s -> %s", app_file, tgt)
-                    app_file.symlink_to(tgt)
-    # Link to lock file
-    lock_path = (
-        locs["apps"] / "conda" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.CONDA]}"
-    )
-    lock_path.symlink_to(os.path.relpath(env_snap.lock_file, lock_path.parent))
+                        app_file.chmod(app_file.stat().st_mode | 0o000550)
+                    else:
+                        tgt = os.path.relpath(env_snap.snap_dir / pkg_file, app_file.parent)
+                        log.debug("Symlinking %s -> %s", app_file, tgt)
+                        app_file.symlink_to(tgt)
+        # Link to lock file
+        lock_path = (
+            locs["apps"] / "conda" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.CONDA]}"
+        )
+        lock_path.symlink_to(os.path.relpath(env_snap.lock_file, lock_path.parent))
+    except Exception:
+        log.exception("Error constructing conda app dir: %s", app_name)
+        rmtree(app_dir)
+        env_snap.remove(keep_lock=False)
+        return None
     # Make app activation scripts
     app_snap = SnapSpec.from_lock_path(lock_path)
     for shell_type in ShellType:

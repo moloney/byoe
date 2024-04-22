@@ -177,6 +177,16 @@ def make_app_act_script(snap_dir: Path, shell_type: ShellType) -> str:
         raise NotImplementedError
 
 
+def stash_failed(*orig: Path) -> None:
+    """Stash a file from a failed run for debugging purposes"""
+    for o in orig:
+        if o is None or not o.exists():
+            continue
+        new = o.parent / f".failed-{str(datetime.now()).replace(' ', '_')}-{o.name}"
+        o.rename(new)
+        log.warning("Stashed file %s -> %s", o, new)
+
+
 def diff_env(pre_env, post_env):
     res = {}
     res["new"] = {k: v for k, v in post_env.items() if k not in pre_env}

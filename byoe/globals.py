@@ -1,4 +1,4 @@
-import re
+import re, shutil, logging
 from enum import Enum
 from pathlib import Path
 from datetime import datetime
@@ -7,6 +7,8 @@ from typing import ClassVar, Dict, Any, Optional
 
 import yaml
 
+
+log = logging.getLogger(__name__)
 
 class SnapType(Enum):
     ENV = "env"
@@ -119,7 +121,7 @@ class SnapSpec:
     def get_activate_path(self, shell: ShellType = ShellType.SH) -> Path:
         """Get path to the activation script"""
         if self.snap_type == SnapType.APP or self.env_type != EnvType.PYTHON:
-            return self.snap_dir.parent / f"{self.snap_dir.name}_activate.{shell.value}"
+            return self.snap_dir.parent / f"{self.snap_dir.name}-activate.{shell.value}"
         elif self.env_type == EnvType.PYTHON:
             if shell == ShellType.SH:
                 suffix = ""
@@ -135,6 +137,30 @@ class SnapSpec:
         else:
             return [l for l in txt_data.split("\n") if not l.strip().startswith("#")]
     
+    def remove(self, keep_lock: bool = True) -> None:
+        """Remove a snap"""
+        assoc_files = [self.snap_dir]
+        for sh_type in ShellType:
+            assoc_files.append(self.get_activate_path(sh_type))
+        if not keep_lock:
+            assoc_files.append(self.lock_file)
+        if self.snap_type == SnapType.ENV:
+            if self.env_type == EnvType.SPACK:
+                assoc_files.append(self.snap_dir.parent / f"._{self.snap_id}")
+                assoc_files.append(self.snap_dir.parent / f"{self.snap_id}-env")
+            elif self.env_type == EnvType.PYTHON:
+                assoc_files.append(self.snap_dir.parent / f"{self.snap_id}-main-req.in")
+                assoc_files.append(self.snap_dir.parent / f"{self.snap_id}-sys-req.txt")
+            elif self.env_type == EnvType.CONDA:
+                assoc_files.append(self.snap_dir.parent / f"{self.snap_id}-in.yml")
+        assoc_files = [x for x in assoc_files if x.exists()]
+        log.info("Removing files associated with snap %s: %s", self, assoc_files)
+        for fp in assoc_files:
+            if fp.is_dir():
+                shutil.rmtree(fp)
+            else:
+                fp.unlink()
+
     @classmethod
     def from_lock_path(cls, lock_path: Path) -> "SnapSpec":
         """Generate a SnapSpec from the path to its lock file"""

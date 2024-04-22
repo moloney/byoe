@@ -384,8 +384,9 @@ class ByoeRepo:
         self,
         env_name: str,
         snap_id: SnapId,
+        keep_partial: bool = False,
         log_file: Optional[TextIOWrapper] = None,
-    ) -> Dict[EnvType, SnapSpec]:
+    ) -> Dict[EnvType, Optional[SnapSpec]]:
         """Create new snapshot of environment"""
         env_conf = self._site_conf.envs[env_name]
         snaps = {}
@@ -409,6 +410,9 @@ class ByoeRepo:
                     snap_id,
                     log_file,
                 )
+                if snaps[EnvType.PYTHON] is None and not keep_partial:
+                    snaps[EnvType.SPACK].remove(keep_lock=False)
+                    snaps[EnvType.SPACK] = None
         elif env_conf.conda:
             snaps[EnvType.CONDA] = update_conda_env(
                 env_name,
@@ -424,8 +428,9 @@ class ByoeRepo:
         self,
         app_name: str,
         snap_id: SnapId,
+        keep_partial: bool = False,
         log_file: Optional[TextIOWrapper] = None,
-    ) -> SnapSpec:
+    ) -> Optional[SnapSpec]:
         app_conf = self._site_conf.apps[app_name]
         if isinstance(app_conf, PythonAppConfig):
             spack = self.get_spack(log_file=log_file)
@@ -449,12 +454,18 @@ class ByoeRepo:
                     snap_id,
                     self._site_conf.build_opts,
                 )
+                if spack_env is None:
+                    return None
                 (py_cmd,) = get_spack_env_cmds(spack_env, ["python"], log_file=log_file)
             # Use pipx to install into an isolated env
             pipx = self.get_pipx(py_cmd._partial_call_args["env"], log_file)
-            return update_python_app(
+            res = update_python_app(
                 app_name, app_conf.python, pipx, py_cmd, self._locs, snap_id
             )
+            if res is None:
+                if not keep_partial:
+                    spack_env.remove(keep_lock=False)
+            return res
         else:
             assert isinstance(app_conf, CondaAppConfig)
             return update_conda_app(
@@ -470,6 +481,7 @@ class ByoeRepo:
         self,
         envs_or_apps: Optional[List[str]] = None,
         pull_spack: bool = True,
+        keep_partial: bool = False,
         log_file: Optional[TextIOWrapper] = None,
     ):
         """Perform updates to configured environments and apps"""
@@ -487,12 +499,16 @@ class ByoeRepo:
             for env_name in envs:
                 if envs_or_apps is not None and env_name not in envs_or_apps:
                     continue
-                env_snaps[env_name] = self._build_env_snap(env_name, snap_id, log_file)
+                env_snaps[env_name] = self._build_env_snap(
+                    env_name, snap_id, keep_partial, log_file
+                )
             app_snaps = {}
             for app_name in apps:
                 if envs_or_apps is not None and app_name not in envs_or_apps:
                     continue
-                app_snaps[app_name] = self._build_app_snap(app_name, snap_id, log_file)
+                app_snaps[app_name] = self._build_app_snap(
+                    app_name, snap_id, keep_partial, log_file
+                )
             (self._locs["envs"] / f"{snap_id}-site_conf.yaml").write_text(
                 yaml.dump(self._site_conf.to_dict())
             )
@@ -632,7 +648,7 @@ class ByoeRepo:
             if extra_act:
                 res.append(f"# BYOE: Extra activation for '{app_name}' app")
                 res.append("\n".join(extra_act))
-        
+
         # Add our own environment modifications
         res.append("\n# BYOE: Custom setup for BYOE itself")
         res.append(f"export BYOE_SNAP_ID={snap_id}")

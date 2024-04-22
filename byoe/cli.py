@@ -57,7 +57,7 @@ def main(
         conf_path = Path(conf_path)
     else:
         conf_path = Path(typer.get_app_dir("byoe")) / "conf.yaml"
-    try: 
+    try:
         conf_data["user"] = get_user_conf(conf_path)
     except MissingConfigError:
         pass
@@ -110,6 +110,7 @@ def init_dir(
 def update(
     env_or_app: Annotated[Optional[List[str]], typer.Argument()] = None,
     pull_spack: bool = True,
+    keep_partial: bool = False,
     log_path: Optional[Path] = None,
 ):
     """Update all configured environments and apps, or just those specified as args"""
@@ -132,7 +133,8 @@ def update(
     try:
         repo.update(
             env_or_app,
-            pull_spack=pull_spack, 
+            pull_spack=pull_spack,
+            keep_partial=keep_partial,
             log_file=log_file,
         )
     except NoCompilerFoundError:
@@ -218,8 +220,8 @@ def activate(
     """Print activation script for an environment plus any number of apps.
 
     Most users (i.e. BASH users) can do 'source <(byoe activate)' to change their
-    current shell environment. Users with FISH as their shell can do 
-    'source (byoe activate | psub)', while any shell (e.g. TCSH) can do 
+    current shell environment. Users with FISH as their shell can do
+    'source (byoe activate | psub)', while any shell (e.g. TCSH) can do
     'source $(activate --tmp)' with the downside of leaving behind a tmp file.
     """
     if snap_id is not None:
