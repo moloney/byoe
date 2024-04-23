@@ -95,6 +95,7 @@ class ByoeRepo:
         internal_dir = base_dir / "._internal"
         pkg_cache = base_dir / "pkg_cache"
         self._locs = {
+            "bin": base_dir / "bin",
             "startup": base_dir / "user_rc",
             "log": base_dir / "logs",
             "tmp": base_dir / "tmp",
@@ -110,7 +111,12 @@ class ByoeRepo:
             "python_cache": pkg_cache / "python",
             "conda_cache": pkg_cache / "conda",
         }
+        self._is_prepped = False
+        if not os.access(self._locs["bin"] / "test", os.W_OK):
+            log.info("User doesn't have write access to repo")
+            return
         for loc in (
+            "bin",
             "startup",
             "log",
             "tmp",
@@ -124,19 +130,21 @@ class ByoeRepo:
             "conda_cache",
         ):
             self._locs[loc].mkdir(exist_ok=True)
+        # Symlink the 'byoe' cli entry point into the bin dir
+        self_bin = self._locs["bin"] / "byoe"
+        if not self_bin.exists():
+            self_bin.symlink_to(os.path.relpath(sys.argv[0], self_bin.parent))
         # Build user startup scripts
         for shell_type in ("sh",):
-            startup_lines = [f"export PATH={Path(sys.argv[0]).parent}:$PATH"]
+            startup_lines = [f"export PATH={self._locs['bin']}:$PATH"]
             startup_lines.append(
-                f"export PIP_FIND_LINKS={' '.join([str(self._locs['python_cache'])] + os.environ.get('PIP_FIND_LINKS', []))}"
+                f"export PIP_FIND_LINKS={str(self._locs['python_cache'])}' '$PIP_FIND_LINKS"
             )
-            startup_lines.append(
-                f"export CONDA_PKGs_DIRS={self._locs['conda_cache']}:$CONDA_PKGS_DIRS"
-            )
+            startup_lines.append(f"export CONDA_PKGS_DIRS={self._locs['conda_cache']}")
             (self._locs["startup"] / f"byoe_startup.{shell_type}").write_text(
                 "\n".join(startup_lines + [""])
             )
-        self._is_prepped = False
+        
 
     @property
     def base_dir(self) -> Path:
