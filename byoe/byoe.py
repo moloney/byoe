@@ -112,8 +112,8 @@ class ByoeRepo:
             "conda_cache": pkg_cache / "conda",
         }
         self._is_prepped = False
-        if not os.access(self._locs["bin"] / "test", os.W_OK):
-            log.info("User doesn't have write access to repo")
+        if not os.access(base_dir / "site_conf.yaml", os.W_OK):
+            log.debug("User doesn't have write access to repo")
             return
         for loc in (
             "bin",
