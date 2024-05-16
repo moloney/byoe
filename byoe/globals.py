@@ -1,14 +1,16 @@
+import os
 import re, shutil, logging
 from enum import Enum
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import ClassVar, Dict, Any, Optional
+from typing import ClassVar, Dict, Any, List, Optional
 
 import yaml
 
 
 log = logging.getLogger(__name__)
+
 
 class SnapType(Enum):
     ENV = "env"
@@ -79,7 +81,7 @@ class SnapId:
 
     @classmethod
     def from_prefix(cls, val: str) -> Optional["SnapId"]:
-        mtch = re.search(fr"^{cls.REGEX}", val)
+        mtch = re.search(rf"^{cls.REGEX}", val)
         if not mtch:
             return None
         return cls.from_str(mtch.group())
@@ -104,7 +106,7 @@ class SnapSpec:
 
     def __lt__(self, other: "SnapSpec"):
         return (self.name, self.snap_id) < (other.name, other.snap_id)
-    
+
     def __str__(self) -> str:
         return f"{self.env_type.name}/{self.snap_name}"
 
@@ -136,14 +138,13 @@ class SnapSpec:
             return yaml.load(txt_data)
         else:
             return [l for l in txt_data.split("\n") if not l.strip().startswith("#")]
-    
-    def remove(self, keep_lock: bool = True) -> None:
-        """Remove a snap"""
+
+    def get_paths(self) -> List[Path]:
+        """Get list of paths associated with the snap"""
         assoc_files = [self.snap_dir]
         for sh_type in ShellType:
             assoc_files.append(self.get_activate_path(sh_type))
-        if not keep_lock:
-            assoc_files.append(self.lock_file)
+        assoc_files.append(self.lock_file)
         if self.snap_type == SnapType.ENV:
             if self.env_type == EnvType.SPACK:
                 assoc_files.append(self.snap_dir.parent / f"._{self.snap_id}")
@@ -154,12 +155,25 @@ class SnapSpec:
             elif self.env_type == EnvType.CONDA:
                 assoc_files.append(self.snap_dir.parent / f"{self.snap_id}-in.yml")
         assoc_files = [x for x in assoc_files if x.exists()]
+        return assoc_files
+
+    def remove(self, keep_lock: bool = True) -> None:
+        """Remove a snap"""
+        assoc_files = self.get_paths()
         log.info("Removing files associated with snap %s: %s", self, assoc_files)
         for fp in assoc_files:
-            if fp.is_dir():
+            if keep_lock and fp == self.lock_file:
+                continue
+            if not fp.is_symlink() and fp.is_dir():
                 shutil.rmtree(fp)
             else:
                 fp.unlink()
+        by_hash = self.snap_dir.parent.parent / ".by_hash"
+        if by_hash.exists():
+            for link_path in by_hash.iterdir():
+                if link_path.is_symlink() and link_path.resolve() in assoc_files:
+                    link_path.unlink()
+                    break
 
     @classmethod
     def from_lock_path(cls, lock_path: Path) -> "SnapSpec":
@@ -171,3 +185,22 @@ class SnapSpec:
         if lock_path.parent.parent.parent.name == "apps":
             snap_type = SnapType.APP
         return cls(snap_id, env_type, name, lock_path.parent / str(snap_id), snap_type)
+
+    @classmethod
+    def make_symlinked(
+        cls, source: "SnapSpec", name: str, new_id: SnapId
+    ) -> "SnapSpec":
+        """Create symlinked snap with `new_id` pointing to `source`"""
+        new_lock = None
+        for src_path in source.get_paths():
+            new_path = (
+                src_path.parent.parent
+                / name
+                / src_path.name.replace(str(source.snap_id), str(new_id))
+            )
+            new_path.symlink_to(
+                os.path.relpath(src_path, new_path.parent), src_path.is_dir()
+            )
+            if src_path == source.lock_file:
+                new_lock = new_path
+        return cls.from_lock_path(new_lock)

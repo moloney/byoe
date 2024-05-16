@@ -1,5 +1,6 @@
 """Manage / build spack environments"""
 
+from hashlib import blake2b
 import json
 import os, logging, shutil
 from datetime import datetime
@@ -115,6 +116,17 @@ def get_spack_concretize(
     )
 
 
+def get_installed(spack: sh.Command) -> List[str]:
+    """Get list of installed packages with version and hash"""
+    installed = json.loads(spack.find(json=True))
+    return [f"{x['name']}@{x['version']}/{x['hash']}" for x in installed]
+
+
+def get_concretized_roots(lock_path: Path) -> List[str]:
+    roots = sorted(json.loads(lock_path.read_text())["roots"], key=lambda x: x["spec"])
+    return [f"{x['spec']}/{x['hash']}" for x in roots]
+
+
 def get_spack_push(
     spack: sh.Command,
     build_config: Optional[BuildConfig] = None,
@@ -122,11 +134,7 @@ def get_spack_push(
     """Get preconfigured 'spack buildcache push' command"""
     if build_config is None:
         build_config = BuildConfig()
-    # We have to manually build spec list, otherwise trying to push a partial 
-    # environment will fail
-    installed = json.loads(spack.find(json=True))
-    specs = [f"{x['name']}@{x['version']}/{x['hash']}" for x in installed]
-    push_args = ["default"] + specs
+    push_args = ["default"] + get_installed(spack)
     return par_spack(
         spack.buildcache.push, push_args, get_job_build_info(build_config, "spack_push")
     )
@@ -280,7 +288,10 @@ def _prep_spack_build(
 
 def _update_spack_env(
     env_dir: Path,
+    name: str,
+    snap_id: SnapId,
     snap_path: Path,
+    by_hash: Path,
     spack: sh.Command,
     spack_install: sh.Command,
     spack_concretize: sh.Command,
@@ -289,33 +300,51 @@ def _update_spack_env(
     """Create updated snapshot of a single environment and cache any built packages"""
     start = datetime.now()
     log.info("Concretizing spack snapshot: %s", snap_path)
-    conc_out = spack_concretize()
-    if not conc_out.strip():
-        log.info("No updates for spack snapshot: %s", snap_path)
-    log.info("Building spack snapshot: %s", snap_path)
-    install_err: Optional[Exception] = None
-    try:
-        spack_install([])
-    except Exception as e:
-        install_err = e
-        log.exception("Error building spack snapshot: %s", snap_path)
+    spack_concretize()
+    orig_lock_path = env_dir / "spack.lock"
+    canon_lock_path = env_dir.parent / f"{snap_id}.lock"
+    snap_hash = blake2b(
+        (",".join(get_concretized_roots(orig_lock_path))).encode(), digest_size=20
+    )
+    hash_link = by_hash / snap_hash.hexdigest()
+    if hash_link.exists():
+        # Link to the previous snap
+        log.info("Found identical spack snap, linking to it")
+        shutil.rmtree(env_dir)
+        shutil.rmtree(env_dir.parent / f"._{snap_id}")
+        (env_dir.parent / str(snap_id)).unlink()
+        prev_snap = SnapSpec.from_lock_path(hash_link.resolve())
+        SnapSpec.make_symlinked(prev_snap, name, snap_id)
     else:
-        log.info(
-            "Finished spack snapshot: %s (took %s)", snap_path, (datetime.now() - start)
-        )
-    log.info("Building spack binary packages")
-    try:
-        spack_push()
-    except:
-        log.exception("Error while pushing to spack buildcache")
-    if install_err is not None:
-        if snap_path.exists():
-            shutil.rmtree(snap_path)
-        raise install_err
-    for sh_type in ("sh", "csh", "fish"):
-        act_script = spack.env.activate(f"--{sh_type}", "-d", str(env_dir))
-        with open(f"{snap_path}_activate.{sh_type}", "wt") as out_f:
-            out_f.write(act_script)
+        shutil.copy(orig_lock_path, canon_lock_path)
+        hash_link.parent.mkdir(exist_ok=True)
+        hash_link.symlink_to(os.path.relpath(canon_lock_path, hash_link.parent))
+        log.info("Building spack snapshot: %s", snap_path)
+        install_err: Optional[Exception] = None
+        try:
+            spack_install([])
+        except Exception as e:
+            install_err = e
+            log.exception("Error building spack snapshot: %s", snap_path)
+        else:
+            log.info(
+                "Finished spack snapshot: %s (took %s)",
+                snap_path,
+                (datetime.now() - start),
+            )
+        log.info("Building spack binary packages")
+        try:
+            spack_push()
+        except:
+            log.exception("Error while pushing to spack buildcache")
+        if install_err is not None:
+            if snap_path.exists():
+                shutil.rmtree(snap_path)
+            raise install_err
+        for sh_type in ("sh", "csh", "fish"):
+            act_script = spack.env.activate(f"--{sh_type}", "-d", str(env_dir))
+            with open(f"{snap_path}-activate.{sh_type}", "wt") as out_f:
+                out_f.write(act_script)
 
 
 def update_spack_env(
@@ -331,18 +360,26 @@ def update_spack_env(
         build_config = BuildConfig()
     spack_envs_dir = locs["envs"] / "spack"
     spack_envs_dir.mkdir(exist_ok=True)
+    by_hash = spack_envs_dir / ".by_hash"
+    by_hash.mkdir(exist_ok=True)
     env_dir = spack_envs_dir / env_name / f"{snap_id}-env"
     snap_path = spack_envs_dir / env_name / str(snap_id)
     spack_env = spack.bake(e=env_dir)
     log.info("Updating spack snap: %s", snap_path)
     try:
         _prep_spack_build(
-            env_dir, snap_path, spack, spack_env, spack_config, build_config, locs["tmp"]
+            env_dir,
+            snap_path,
+            spack,
+            spack_env,
+            spack_config,
+            build_config,
+            locs["tmp"],
         )
     except:
         log.exception("Error preparing spack environment: %s", env_dir)
         # TODO:
-        #if env_dir.exists():
+        # if env_dir.exists():
         #    shutil.rmtree(env_dir)
         return None
     # Prepare spack concretize/install/push commands for the environment
@@ -355,14 +392,21 @@ def update_spack_env(
     success = True
     try:
         _update_spack_env(
-            env_dir, snap_path, spack, spack_install, spack_concretize, spack_push
+            env_dir,
+            env_name,
+            snap_id,
+            snap_path,
+            by_hash,
+            spack,
+            spack_install,
+            spack_concretize,
+            spack_push,
         )
     except:
-        log.error("Error building spack environment: %s", env_dir)
+        log.exception("Error building spack environment: %s", env_dir)
         success = False
     else:
         conv_view_links(snap_path)
-        shutil.copy(env_dir / "spack.lock", lock_path)
     log.info("Updating spack buildcache index")
     try:
         spack.buildcache("update-index", "default")
@@ -378,7 +422,7 @@ def update_spack_env(
 
 def unset_implicit_pypath(spack_env: Path, act_env: Dict[str, str]) -> None:
     # It seems like spack sets PYTHONPATH  when not needed, which screws up layering of
-    # virtual envs. Unset it here with some sanity checks that only the implicit 
+    # virtual envs. Unset it here with some sanity checks that only the implicit
     # "site-packages" dir is included before we get rid of it
     py_path = act_env.get("PYTHONPATH")
     if py_path:
