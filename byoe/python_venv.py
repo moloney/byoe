@@ -51,6 +51,9 @@ def update_python_env(
     kwargs = {}
     sys_pkgs = python_config.system_packages
     log.debug("Creating venv: %s", snap_path)
+    if sys_pkgs:
+        log.debug("Using --system-site-packages")
+        kwargs["system_site_packages"] = True
     build_err: Optional[Exception] = None
     sys_req_path = main_req_path = lock_path = None
     try:

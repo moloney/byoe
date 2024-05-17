@@ -140,26 +140,6 @@ def get_spack_push(
     )
 
 
-def conv_view_links(view_dir: Path):
-    """Convert symlinks in a view to hardlinks"""
-    for dir, sub_dirs, sub_files in os.walk(view_dir):
-        for file_path in sub_files:
-            file_path = Path(file_path)
-            if file_path.is_symlink():
-                tgt = file_path.readlink()
-                try:
-                    rel_path = tgt.relative_to(view_dir)
-                except ValueError:
-                    # TODO: make the hardlink
-                    pass
-                else:
-                    # make relative symlink
-                    pass
-            else:
-                # TODO: Check if canonical path is outside the view
-                pass
-
-
 def get_compilers(spack):
     """Get compilers spack knows about"""
     return [x.strip() for x in spack.compiler.list().split("\n")[2:] if x.strip()]
@@ -263,7 +243,7 @@ def _prep_spack_build(
         "default": {
             "root": str(snap_path),
             "link": "all",
-            "link_type": "symlink",
+            "link_type": "hardlink",
         }
     }
     spec_path = env_dir / "spack.yaml"
@@ -338,8 +318,12 @@ def _update_spack_env(
         except:
             log.exception("Error while pushing to spack buildcache")
         if install_err is not None:
+            shutil.rmtree(env_dir)
+            shutil.rmtree(env_dir.parent / f"._{snap_id}")
             if snap_path.exists():
-                shutil.rmtree(snap_path)
+                snap_path.unlink()
+            if hash_link.exists() and hash_link.resolve() == canon_lock_path:
+                hash_link.unlink()
             raise install_err
         for sh_type in ("sh", "csh", "fish"):
             act_script = spack.env.activate(f"--{sh_type}", "-d", str(env_dir))
@@ -405,8 +389,6 @@ def update_spack_env(
     except:
         log.exception("Error building spack environment: %s", env_dir)
         success = False
-    else:
-        conv_view_links(snap_path)
     log.info("Updating spack buildcache index")
     try:
         spack.buildcache("update-index", "default")
