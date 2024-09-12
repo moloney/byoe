@@ -110,6 +110,7 @@ def init_dir(
 def update(
     env_or_app: Annotated[Optional[List[str]], typer.Argument()] = None,
     pull_spack: bool = True,
+    label: Optional[str] = None,
     keep_partial: bool = False,
     log_path: Optional[Path] = None,
 ):
@@ -134,6 +135,7 @@ def update(
         repo.update(
             env_or_app,
             pull_spack=pull_spack,
+            label=label,
             keep_partial=keep_partial,
             log_file=log_file,
         )
@@ -182,18 +184,19 @@ def run(
     ctx: typer.Context,
     byoe_name: Optional[str] = None,
     byoe_channel: Optional[UpdateChannel] = None,
-    byoe_time_stamp: Optional[str] = None,
-    byoe_skip_layer: Optional[List[EnvType]] = None,
-    byoe_shell_type: Optional[ShellType] = None,
+    byoe_snap_id: Optional[str] = None,
+    byoe_skip_py_env: bool = False
 ):
     """Run the given command inside a byoe environment (use `--byoe-help` for details)"""
+    if byoe_snap_id is not None:
+        byoe_snap_id = SnapId.from_str(byoe_snap_id)
     repo = ByoeRepo(conf_data["user"].base_dir)
     act_script = repo.get_activate_script(
         byoe_name,
         byoe_channel,
-        byoe_time_stamp,
-        byoe_skip_layer,
-        ShellType.SH,
+        byoe_snap_id,
+        byoe_skip_py_env,
+        shell_type=ShellType.SH,
     )
     # TODO: If we're launching this in a shell we should just source the activation
     #       script there before running the users code. Also since we are running a

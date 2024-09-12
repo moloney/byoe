@@ -56,7 +56,6 @@ class ShellType(Enum):
     FISH = "fish"
 
 
-# TODO: Need some way to track "test" snaps that would have to be explicitly activated
 @dataclass(frozen=True)
 class SnapId:
     """Uniquely identify a snaphot"""
@@ -65,29 +64,36 @@ class SnapId:
 
     version: int = 0
 
-    REGEX: str = r"([0-9]+)(\.[0-9]+)?"
+    label: Optional[str] = None
+
+    REGEX: str = r"^([0-9]+)(?:\.([A-Za-z]+)?([0-9]+))?$"
 
     def __repr__(self) -> str:
-        if self.version == 0:
+        if self.version == 0 and self.label is None:
             return f"{self.time_stamp.strftime(TS_FORMAT)}"
-        return f"{self.time_stamp.strftime(TS_FORMAT)}.{self.version}"
+        elif self.label is None:
+            return f"{self.time_stamp.strftime(TS_FORMAT)}.{self.version}"
+        else:
+            return f"{self.time_stamp.strftime(TS_FORMAT)}.{self.label}{self.version}"
 
     @classmethod
     def from_str(cls, val: str) -> "SnapId":
-        toks = val.split(".")
-        ts = datetime.strptime(toks[0], TS_FORMAT)
-        vers = 0 if len(toks) == 1 else int(toks[1])
-        return cls(ts, vers)
+        ts, label, vers = re.match(cls.REGEX, val).groups()
+        ts = datetime.strptime(ts, TS_FORMAT)
+        vers = 0 if vers is None else int(vers)
+        return cls(ts, vers, label)
 
     @classmethod
     def from_prefix(cls, val: str) -> Optional["SnapId"]:
-        mtch = re.search(rf"^{cls.REGEX}", val)
+        mtch = re.search(rf"^{cls.REGEX[:-1]}", val)
         if not mtch:
             return None
         return cls.from_str(mtch.group())
 
     def __lt__(self, other):
-        return (self.time_stamp, self.version) < (other.time_stamp, other.version)
+        self_lbl = self.label if self.label is not None else ''
+        other_lbl = other.label if other.label is not None else ''
+        return (self.time_stamp, self_lbl, self.version) < (other.time_stamp, other_lbl, other.version)
 
 
 @dataclass(frozen=True)

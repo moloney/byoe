@@ -489,6 +489,7 @@ class ByoeRepo:
         self,
         envs_or_apps: Optional[List[str]] = None,
         pull_spack: bool = True,
+        label: Optional[str] = None,
         keep_partial: bool = False,
         log_file: Optional[TextIOWrapper] = None,
     ):
@@ -499,7 +500,7 @@ class ByoeRepo:
             return
         envs = [] if conf.envs is None else list(conf.envs.keys())
         apps = [] if conf.apps is None else list(conf.apps.keys())
-        snap_id, reserve_path = self._allocate_snap_id()
+        snap_id, reserve_path = self._allocate_snap_id(label=label)
         log.info("Using snap id: %s", snap_id)
         try:
             self.prep_dir(pull_spack)
@@ -586,6 +587,8 @@ class ByoeRepo:
         if not avail:
             raise ValueError(f"No snapshots available")
         if snap_id is None:
+            # Labeled snaps are never auto selected, must be explicitly requested
+            avail = [x for x in avail if x.label is None]
             snap_id = select_snap(avail, CHANNEL_UPDATE_MONTHS[channel])
             log.info("Using channel %s selects snap: %s", channel, snap_id)
         elif snap_id not in avail:
@@ -672,7 +675,7 @@ class ByoeRepo:
         return "\n".join(res)
 
     def _allocate_snap_id(
-        self, time_stamp: Optional[datetime] = None
+        self, time_stamp: Optional[datetime] = None, label: Optional[str] = None
     ) -> Tuple[SnapId, Path]:
         """Allocate next unique SnapId in sequence"""
         if time_stamp is None:
@@ -685,20 +688,24 @@ class ByoeRepo:
             if snap_id is None:
                 log.warning("Skipping potential snap config: %s", snap_conf)
                 continue
+            if snap_id.label != label:
+                continue
             log.debug("Found existing snap: %s", snap_id)
             if min_vers <= snap_id.version:
                 min_vers = snap_id.version + 1
         for in_prog in self._locs["envs"].glob(
             f".in-progress-{time_stamp.strftime(TS_FORMAT)}*"
         ):
-            snap_id = SnapId.from_prefix(snap_conf.name.split("-")[-1])
+            snap_id = SnapId.from_prefix(in_prog.name.split("-")[-1])
             if not snap_id:
+                continue
+            if snap_id.label != label:
                 continue
             if min_vers <= snap_id.version:
                 min_vers = snap_id.version + 1
         n_tries = 0
         while n_tries < 3:
-            snap_id = SnapId(time_stamp, min_vers)
+            snap_id = SnapId(time_stamp, min_vers, label=label)
             log.debug("Tring to allocate snap_id: %s", snap_id)
             # TODO: Use flufl.lock here?
             reserve_path = self._locs["envs"] / f".in-progress-{snap_id}"
