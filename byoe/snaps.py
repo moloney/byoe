@@ -189,6 +189,7 @@ class SnapSpec:
                 assoc_files.append(self.snap_path.parent / f"{self.snap_id}-sys-req.txt")
             elif self.env_type == EnvType.CONDA:
                 assoc_files.append(self.snap_path.parent / f"{self.snap_id}-in.yml")
+                assoc_files.append(self.snap_path.parent / f"{self.snap_id}-virtual.yml")
         assoc_files = [x for x in assoc_files if x.exists()]
         return assoc_files
 

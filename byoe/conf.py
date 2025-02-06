@@ -347,10 +347,12 @@ class CondaConfig(IncludableConfig):
 
     specs: List[str] = field(default_factory=list)
 
+    virtual: Dict[str, str] = field(default_factory=dict)
+
     @classmethod
     def filt_include(cls, include_data):
         needs_del = [
-            k for k in include_data if k not in ("channels", "specs", "dependencies")
+            k for k in include_data if k not in ("channels", "specs", "dependencies", "virtual")
         ]
         for key in needs_del:
             del include_data[key]
@@ -406,6 +408,8 @@ class CondaAppConfig(IncludableConfig):
     default: bool = True
 
     extra_activation: Optional[List[str]] = None
+
+    exec_prelude: Optional[Dict[str, List[str]]] = None
 
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         if "conda" in defaults:

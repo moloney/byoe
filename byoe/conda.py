@@ -103,14 +103,22 @@ def update_conda_env(
     lock_path = envs_dir / env_name / f"{snap_id}-lock.yml"
     snap = SnapSpec.from_lock_path(lock_path)
     abstract_conf.write_text(yaml.dump(conf_data))
+    platform_id = get_conda_platform()
+    kwargs = {}
+    if conda_config.virtual:
+        virtual = {"subdirs" : {platform_id : {"packages" : conda_config.virtual}}}
+        virtual_conf = envs_dir / env_name / f"{snap_id}-virtual.yml"
+        virtual_conf.write_text(yaml.dump(virtual))
+        kwargs["virtual_package_spec"] = str(virtual_conf)
     log.info("Running conda-lock on input: %s", abstract_conf)
     try:
         conda_lock.lock(
             micromamba=True,
             conda=str(micromamba),
-            platform=get_conda_platform(),
+            platform=platform_id,
             f=str(abstract_conf),
             lockfile=str(lock_path),
+            **kwargs,
         )
         if snap.dedupe():
             return snap
@@ -147,6 +155,7 @@ def update_conda_env(
 _CONDA_WRAP_SCRIPT = """\
 #!/bin/sh
 unset PYTHONPATH PYTHONHOME
+{prelude}
 {micromamba} -r {root_prefix} -p {env_path} run {cmd} "$@"
 """
 
@@ -175,6 +184,10 @@ def update_conda_app(
         re.compile(k1): {re.compile(k2): re.compile(v2) for k2, v2 in v1.items()}
         for k1, v1 in export_filt.items()
     }
+    exec_preludes = {}
+    if app_config.exec_prelude:
+        for pattern, prelude_lines in app_config.exec_prelude.items():
+            exec_preludes[re.compile(pattern)] = prelude_lines
     app_dir.mkdir(parents=True)
     try:
         for spec in app_config.conda.specs:
@@ -224,12 +237,17 @@ def update_conda_app(
                     app_file.parent.mkdir(exist_ok=True, parents=True)
                     if pkg_sub_dir == "bin":
                         log.debug("Making wrapper %s -> %s", app_file, pkg_file)
+                        pre_lines = []
+                        for expr, lines in exec_preludes.items():
+                            if re.match(expr, pkg_file.name):
+                                pre_lines.extend(lines)
                         app_file.write_text(
                             _CONDA_WRAP_SCRIPT.format(
                                 root_prefix=locs["conda"],
                                 micromamba=str(micromamba),
                                 env_path=env_snap.snap_path,
                                 cmd=pkg_file.name,
+                                prelude="\n".join(pre_lines),
                             )
                         )
                         app_file.chmod(app_file.stat().st_mode | 0o000550)
