@@ -1,17 +1,17 @@
 import os, shlex, json, logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from io import TextIOWrapper
 from difflib import unified_diff
 from typing import List, Dict, Optional, Tuple, Union
 
-import sh
+import sh # type: ignore
+
+from .globals import ShellType
+from .snaps import SnapId, SnapSpec
+
 
 sh = sh.bake(_tty_out=False)
-
-from .globals import ShellType, SnapId, SnapSpec
-
-
 bash = sh.bash
 which = sh.which
 try:
@@ -28,6 +28,8 @@ def select_snap(
     snap_ids: List[SnapId], period: int, now: Optional[datetime] = None
 ) -> SnapId:
     """Select snapshot date base on the `period` (and `now`)"""
+    if not snap_ids:
+        raise ValueError("Can't select from empty list of `snap_ids`")
     if now is None:
         now = datetime.now()
     if period > 12:
@@ -41,7 +43,7 @@ def select_snap(
         if 12 % period != 0:
             raise ValueError("Update periods under 12 months must evenly divide 12")
         tgt = datetime(now.year, now.month - ((now.month - 1) % period), 1)
-    by_delta = {}
+    by_delta: Dict[timedelta, List[SnapId]] = {}
     min_delta = None
     log.debug("Target date is %s Selecting from snap_ids: %s", tgt, snap_ids)
     for snap_id in snap_ids:
@@ -51,6 +53,7 @@ def select_snap(
         by_delta[delta].append(snap_id)
         if min_delta is None or delta < min_delta:
             min_delta = delta
+    assert min_delta is not None
     return sorted(by_delta[min_delta])[-1]
 
 
@@ -67,6 +70,7 @@ def get_closest_snap(
             return snaps
     if avail:
         return avail[-1]
+    return None
 
 
 def get_activated_envrion(
@@ -102,35 +106,72 @@ def get_ssl_env():
     return env_data
 
 
-def get_env_cmd(
-    cmd: Union[str, Path],
-    env: Dict[str, str],
+def get_sh_special(cmd: sh.Command):
+    """Get special kwargs used to create thie command"""
+    return {
+        f"_{kw}": val if not hasattr(val, "copy") else val.copy()
+        for kw, val in cmd._partial_call_args.items()
+    }
+
+
+def get_cmd(
+    cmd: Union[str, Path, sh.Command],
+    env: Optional[Dict[str, str]] = None,
     log_file: Optional[TextIOWrapper] = None,
-) -> sh.Command:
-    """Get a command within a modified environment"""
-    extra_sh_kwargs = {"_env": env}
+    ref_cmd: Optional[sh.Command] = None,
+):
+    """Helper to create / modify sh.Command instances with environment mods and logging
+    
+    The environment / logging setting priorities are `env` / `log_file` args > `ref_cmd`
+    attributes > `cmd` attributes (if it is a `sh.Command`). 
+    """
+    special = {}
+    if isinstance(cmd, sh.Command):
+        special.update(get_sh_special(cmd))
+    if ref_cmd is not None:
+        special.update(get_sh_special(ref_cmd))
+    if env:
+        if "_env" not in special:
+            special["_env"] =  {}
+        special["_env"].update(env)
     if log_file:
-        extra_sh_kwargs["_out"] = log_file
-        extra_sh_kwargs["_err"] = log_file
-        extra_sh_kwargs["_tee"] = {"err", "out"}
-    cmd = Path(cmd)
-    if cmd.is_absolute():
-        cmd_path = str(cmd)
+        special["_out"] = log_file
+        special["_err"] = log_file
+        special["_tee"] = {"err", "out"}
+    if isinstance(cmd, sh.Command):
+        cmd = cmd.bake(**special)
     else:
-        cmd_path = which(str(cmd), _env=env).strip("\n")
-    return getattr(sh, cmd_path).bake(**extra_sh_kwargs)
+        cmd = Path(cmd)
+        if cmd.is_absolute():
+            cmd_path = str(cmd)
+        else:
+            try:
+                cmd_path = which(str(cmd), _env=env).strip("\n")
+            except sh.ErrorReturnCode:
+                raise sh.CommandNotFound(cmd)
+        cmd = getattr(sh, cmd_path).bake(**special)
+    return cmd
 
 
 def wrap_cmd(
     wrapper_cmd: sh.Command,
     inner_cmd: sh.Command,
     inject_env: Optional[Dict[str, str]] = None,
+    make_inner_relative: bool = False,
 ) -> sh.Command:
-    """Call ``wrapper_cmd`` with ``inner_cmd`` as the final arguments"""
-    args = [inner_cmd._path] + inner_cmd._partial_baked_args
-    sh_kwargs = {}
-    for kw, val in inner_cmd._partial_call_args.items():
-        sh_kwargs[f"_{kw}"] = val if not hasattr(val, "copy") else val.copy()
+    """Call ``wrapper_cmd`` with ``inner_cmd`` as the final arguments
+    
+    If `make_inner_relative` is true we use the relative command name instead of the 
+    absolute path, which is needed when the wrapper could change the path we want to 
+    use.
+    """
+    inner_path = Path(inner_cmd._path)
+    if make_inner_relative:
+        inner_str = inner_path.name
+    else:
+        inner_str = str(inner_path)
+    args = [inner_str] + inner_cmd._partial_baked_args
+    sh_kwargs = get_sh_special(inner_cmd)
     if inject_env:
         if "_env" not in sh_kwargs:
             sh_kwargs["_env"] = os.environ.copy()
@@ -142,12 +183,13 @@ def srun_wrap(
     cmd: sh.Command,
     n_cpus: int = 1,
     base_args: str = "",
-    tmp_dir: Optional[str] = None,
+    tmp_dir: Optional[Union[str, Path]] = None,
+    make_inner_relative: bool = False,
 ) -> sh.Command:
     """Wrap existing sh.Command to run on slurm with 'srun'"""
     srun_args = shlex.split(base_args) + ["--cpus-per-task=%s" % n_cpus]
-    inject_env = None if tmp_dir is None else {"TMPDIR": tmp_dir}
-    return wrap_cmd(srun.bake(srun_args), cmd, inject_env)
+    inject_env = None if tmp_dir is None else {"TMPDIR": str(tmp_dir)}
+    return wrap_cmd(srun.bake(srun_args), cmd, inject_env, make_inner_relative)
 
 
 def make_app_act_script(snap_dir: Path, shell_type: ShellType) -> str:
@@ -177,14 +219,57 @@ def make_app_act_script(snap_dir: Path, shell_type: ShellType) -> str:
         raise NotImplementedError
 
 
-def stash_failed(*orig: Path) -> None:
-    """Stash a file from a failed run for debugging purposes"""
-    for o in orig:
-        if o is None or not o.exists():
+def parse_env_set(line: str, shell_type: ShellType) -> Optional[Tuple[str, str]]:
+    toks=line.split()
+    if len(toks) < 2:
+        return None
+    if shell_type is ShellType.SH:
+        if toks[0] != "export":
+            return None
+        name = toks[1].split("=")[0]
+        val = "=".join(line.split("=")[1:])
+    elif shell_type is ShellType.CSH:
+        if toks[0] != "setenv":
+            return None
+        name = toks[1]
+        val = " ".join(toks[2:])
+    elif shell_type is ShellType.FISH:
+        if toks[0] != "set" and toks[1] != "-gx":
+            return None
+        name = toks[2]
+        val = " ".join(toks[3:])
+    else:
+        raise NotImplementedError
+    return name, val
+
+
+def format_env_set(name: str, val:str, shell_type: ShellType) -> str:
+    if shell_type is ShellType.SH:
+        return f"export {name}={val}"
+    elif shell_type is ShellType.CSH:
+        return f"setenv {name} {val}"
+    elif shell_type is ShellType.FISH:
+        return f"set -gx {name} {val}"
+    else:
+        raise NotImplementedError
+
+
+def unexpand_act_vars(act_script: str, shell_type: ShellType) -> str:
+    orig_lines = act_script.split("\n")
+    patched_lines = []
+    for line in orig_lines:
+        res = parse_env_set(line, shell_type)
+        if res is None:
+            patched_lines.append(line)
             continue
-        new = o.parent / f".failed-{str(datetime.now()).replace(' ', '_')}-{o.name}"
-        o.rename(new)
-        log.warning("Stashed file %s -> %s", o, new)
+        name, new_val = res
+        old_val = os.environ.get(name)
+        if old_val is not None:
+            new_val = new_val.replace(old_val, f"${{{name}}}")
+            patched_lines.append(format_env_set(name, new_val, shell_type))
+        else:
+            patched_lines.append(line)
+    return "\n".join(patched_lines)
 
 
 def diff_env(pre_env, post_env):

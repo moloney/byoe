@@ -1,53 +1,47 @@
+"""Manage and build Python environments and apps"""
 import os, logging, shutil
 from pathlib import Path
 from io import TextIOWrapper
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
-import sh
+import sh # type: ignore
 
-from .globals import ShellType, SnapId, SnapSpec
-from .util import get_env_cmd, get_activated_envrion, make_app_act_script, stash_failed
+from .globals import ShellType
+from .snaps import SnapId, SnapSpec
+from .util import get_cmd, get_activated_envrion, make_app_act_script
 from .conf import PythonConfig
-from .spack import get_spack_env_cmds, unset_implicit_pypath
 
 
 log = logging.getLogger(__name__)
 
 
-# TODO: Take the 'python' sh.Command that is configured for spack instead of the
-#       'spack_env', then just copy its _env
 def get_venv_cmds(
-    spack_env: Path,
+    python: sh.Command,
     py_venv: Path,
     cmds: List[str],
     log_file: Optional[TextIOWrapper] = None,
 ) -> List[sh.Command]:
-    """Get a command inside spack env / python venv"""
-    act_scripts = [
-        (spack_env.parent / f"{spack_env.name}-activate.sh").read_text(),
-        (py_venv / "bin" / "activate").read_text(),
-    ]
-    act_env = get_activated_envrion(act_scripts)
-    unset_implicit_pypath(spack_env, act_env)
+    """Get commands inside a python venv"""
     env_bin = py_venv / "bin"
-    return [get_env_cmd(env_bin / cmd, act_env, log_file=log_file) for cmd in cmds]
+    return [get_cmd(env_bin / cmd, log_file=log_file, ref_cmd=python) for cmd in cmds]
 
 
-# TODO: Make this more generic (i.e. don't pass in spack_snap), but do need some way
-#       to pass in environment modifications too.
 def update_python_env(
     env_name: str,
     python_config: PythonConfig,
-    spack_snap: Path,
+    python: sh.Command,
     locs: Dict[str, Path],
     snap_id: SnapId,
-    log_file: Optional[TextIOWrapper] = None,
-) -> Optional[SnapSpec]:
+    best_effort: bool = False,
+) -> Tuple[SnapSpec, bool]:
+    """Create updated snapshot of python environment"""
     wheels_dir = locs["python_cache"]
     wheels_dir.mkdir(parents=True, exist_ok=True)
-    snap_path = locs["envs"] / "python" / env_name / str(snap_id)
-    snap_path.parent.mkdir(exist_ok=True, parents=True)
-    python = get_spack_env_cmds(spack_snap.snap_dir, ["python"], log_file=log_file)[0]
+    env_dir = locs["envs"] / "python" / env_name
+    env_dir.mkdir(exist_ok=True, parents=True)
+    snap_path = env_dir / str(snap_id)
+    lock_path = env_dir / f"{snap_id}-requirements.txt"
+    snap = SnapSpec.from_lock_path(lock_path)
     kwargs = {}
     sys_pkgs = python_config.system_packages
     log.debug("Creating venv: %s", snap_path)
@@ -55,14 +49,13 @@ def update_python_env(
         log.debug("Using --system-site-packages")
         kwargs["system_site_packages"] = True
     build_err: Optional[Exception] = None
-    sys_req_path = main_req_path = lock_path = None
+    sys_req_path = main_req_path = None
     try:
         python("-m", "venv", snap_path, **kwargs)
-        pip = get_venv_cmds(spack_snap.snap_dir, snap_path, ["pip"], log_file)[0]
-        pip.install("-U", "pip")
+        pip = get_venv_cmds(python, snap_path, ["pip"])[0]
         pip.install("pip-tools")
         pip_compile, pip_sync = get_venv_cmds(
-            spack_snap.snap_dir, snap_path, ["pip-compile", "pip-sync"], log_file
+            python, snap_path, ["pip-compile", "pip-sync"]
         )
         if sys_pkgs:
             sys_req_path = locs["envs"] / "python" / env_name / f"{snap_id}-sys-req.txt"
@@ -74,8 +67,12 @@ def update_python_env(
                 out_f.write(f"-c {sys_req_path}\n")
             for spec in python_config.specs:
                 out_f.write(f"{spec}\n")
-        lock_path = locs["envs"] / "python" / env_name / f"{snap_id}-requirements.txt"
-        log.info("Running pip-compile for venv: %s", snap_path)
+    except:
+        log.error("Error initializing python venv: %s", snap_path)
+        snap.stash_failed()
+        raise
+    log.info("Running pip-compile for venv: %s", snap_path)
+    try:
         pip_compile(
             main_req_path,
             output_file=str(lock_path),
@@ -83,23 +80,33 @@ def update_python_env(
             allow_unsafe=True,
             verbose=True,
         )
-        log.info("Running pip-sync to build venv: %s", snap_path)
+        if snap.dedupe():
+            return (snap, True)
+    except:
+        log.error("Error resolving dependencies for python venv: %s", snap_path)
+        snap.stash_failed()
+        raise
+    log.info("Running pip-sync to build venv: %s", snap_path)
+    no_errors = True
+    try:
         pip_sync(str(lock_path), pip_args=f"--find-links {wheels_dir}")
     except Exception as e:
+        if not best_effort:
+            log.error("Python venv build failed: %s", snap_path)
+            snap.stash_failed()
+        else:
+            log.warning("Error occured, but keeping best effort python venv: %s", snap_path)
+            no_errors = False
         build_err = e
-        log.exception("Python venv update failed: %s", snap_path)
     if snap_path.exists():
         log.debug("Updating python wheels dir")
         try:
             pip.wheel(find_links=str(wheels_dir), w=str(wheels_dir), r=str(lock_path))
         except:
             log.exception("Error while building wheels from env: %s", snap_path)
-    if build_err is not None:
-        stash_failed(sys_req_path, main_req_path, lock_path)
-        if snap_path.exists():
-            shutil.rmtree(snap_path)
-        return None
-    return SnapSpec.from_lock_path(lock_path)
+    if build_err is not None and not best_effort:
+        raise build_err
+    return (snap, no_errors)
 
 
 def update_python_app(
@@ -141,7 +148,7 @@ def update_python_app(
     act_path = env_dir / "bin" / "activate"
     app_lock_path = locs["apps"] / "python" / app_name / f"{snap_id}-requirements.txt"
     env_lock_path = locs["envs"] / "python" / app_name / f"{snap_id}-requirements.txt"
-    env_python = get_env_cmd("python", get_activated_envrion([act_path.read_text()]))
+    env_python = get_cmd("python", get_activated_envrion([act_path.read_text()]))
     app_lock_path.write_text(env_python("-m", "pip", "freeze"))
     env_lock_path.symlink_to(os.path.relpath(app_lock_path, env_lock_path.parent))
     app_snap = SnapSpec.from_lock_path(app_lock_path)

@@ -1,15 +1,19 @@
-import json
-import logging, io, tarfile, platform, requests, re
-import os
+"""Manage and build Conda environments and apps"""
+import os, logging, io, tarfile, platform, json, re
 from shutil import copyfileobj, rmtree
 from pathlib import Path
 from typing import Dict, Optional
 
+import requests
 import yaml
-import sh
+import sh # type: ignore
 from sh import CommandNotFound
 
-from byoe.util import make_app_act_script, stash_failed
+from .globals import EnvType, ShellType, LOCK_SUFFIXES
+from .snaps import SnapId, SnapSpec
+from .conf import CondaAppConfig, CondaConfig
+from .util import make_app_act_script
+
 
 sh = sh.bake(_tty_out=False)
 try:
@@ -17,9 +21,6 @@ try:
     HAS_SLURM = True
 except CommandNotFound:
     HAS_SLURM = False
-
-from .globals import EnvType, ShellType, SnapId, SnapSpec, LOCK_SUFFIXES
-from .conf import CondaAppConfig, CondaConfig
 
 
 log = logging.getLogger(__name__)
@@ -70,6 +71,8 @@ def fetch_prebuilt(
         out_path = bin_dir / fn
         if fn in ("micromamba", "micromamba.exe"):
             src = tf.extractfile(mem)
+            if src is None:
+                raise ValueError(f"Unable to find micromamba executable in tarfile from: {full_url}")
             with out_path.open("wb") as dest:
                 copyfileobj(src, dest)
             out_path.chmod(out_path.stat().st_mode | 0o000550)
@@ -84,7 +87,7 @@ def update_conda_env(
     micromamba: sh.Command,
     locs: Dict[str, Path],
     snap_id: SnapId,
-) -> Optional[SnapSpec]:
+) -> SnapSpec:
     """Create updated snapshot of a conda environment"""
     envs_dir = locs["envs"] / "conda"
     snap_dir = envs_dir / env_name / str(snap_id)
@@ -97,8 +100,9 @@ def update_conda_env(
     conf_data["dependencies"] = conda_config.specs
     snap_dir.parent.mkdir(parents=True, exist_ok=True)
     abstract_conf = envs_dir / env_name / f"{snap_id}-in.yml"
-    abstract_conf.write_text(yaml.dump(conf_data))
     lock_path = envs_dir / env_name / f"{snap_id}-lock.yml"
+    snap = SnapSpec.from_lock_path(lock_path)
+    abstract_conf.write_text(yaml.dump(conf_data))
     log.info("Running conda-lock on input: %s", abstract_conf)
     try:
         conda_lock.lock(
@@ -108,24 +112,17 @@ def update_conda_env(
             f=str(abstract_conf),
             lockfile=str(lock_path),
         )
+        if snap.dedupe():
+            return snap
     except sh.ErrorReturnCode:
-        log.exception(
-            "Failed to build conda lock file from spec: %s", abstract_conf
-        )
-        stash_failed(abstract_conf)
-        return None
+        log.error("Failed to build conda lock file from spec: %s", abstract_conf)
+        snap.stash_failed()
+        raise
     log.info("Installing conda packages into dir: %s", snap_dir)
     try:
         conda_lock.install(
             str(lock_path), micromamba=True, conda=str(micromamba), prefix=str(snap_dir)
         )
-    except sh.ErrorReturnCode:
-        log.exception("Failed to build conda snap: %s", snap_dir)
-        stash_failed(abstract_conf, lock_path)
-        if snap_dir.exists():
-            rmtree(snap_dir)
-        return None
-    else:
         # Generate activation scripts
         for shell_type in ShellType:
             if shell_type == ShellType.SH:
@@ -140,7 +137,11 @@ def update_conda_env(
             act_path.write_text(
                 micromamba.shell.activate(prefix=str(snap_dir), shell=conda_sh)
             )
-    return SnapSpec.from_lock_path(lock_path)
+    except sh.ErrorReturnCode:
+        log.error("Failed to build conda snap: %s", snap_dir)
+        snap.stash_failed()
+        raise
+    return snap
 
 
 _CONDA_WRAP_SCRIPT = """\
@@ -165,23 +166,28 @@ def update_conda_app(
     if env_snap is None:
         return None
     app_dir = locs["apps"] / "conda" / app_name / str(snap_id)
-    meta_dir = env_snap.snap_dir / "conda-meta"
+    meta_dir = env_snap.snap_path / "conda-meta"
     log.debug("Looking for package meta-data under: %s", meta_dir)
     export_filt = app_config.exported
     if export_filt is None:
         export_filt = {".*": {"bin": ".*", "man": ".+"}}
-    export_filt = {
+    export_filt_exprs = {
         re.compile(k1): {re.compile(k2): re.compile(v2) for k2, v2 in v1.items()}
         for k1, v1 in export_filt.items()
     }
     app_dir.mkdir(parents=True)
     try:
         for spec in app_config.conda.specs:
-            pkg_name = re.match("([^\s<>=~!]+).*", spec).groups()[0]
+            mtch = re.match("([^\s<>=~!]+).*", spec)
+            assert mtch is not None
+            pkg_name = mtch.groups()[0]
             pkg_filt = None
-            for pkg_expr, pfilt in export_filt.items():
+            for pkg_expr, pfilt in export_filt_exprs.items():
                 if re.match(pkg_expr, pkg_name):
                     pkg_filt = pfilt
+                    log.debug(
+                        "Exporting from package '%s' using filt: %s", pkg_name, pfilt
+                    )
                     break
             else:
                 log.debug("Not exporting from package: %s", pkg_name)
@@ -200,6 +206,11 @@ def update_conda_app(
                     for sub_dir_expr, fexpr in pkg_filt.items():
                         if re.match(sub_dir_expr, pkg_sub_dir):
                             file_expr = fexpr
+                            log.debug(
+                                "Exporting from sub_dir '%s' using filter: %s", 
+                                pkg_sub_dir, 
+                                fexpr,
+                            )
                             break
                     else:
                         continue
@@ -217,13 +228,13 @@ def update_conda_app(
                             _CONDA_WRAP_SCRIPT.format(
                                 root_prefix=locs["conda"],
                                 micromamba=str(micromamba),
-                                env_path=env_snap.snap_dir,
+                                env_path=env_snap.snap_path,
                                 cmd=pkg_file.name,
                             )
                         )
                         app_file.chmod(app_file.stat().st_mode | 0o000550)
                     else:
-                        tgt = os.path.relpath(env_snap.snap_dir / pkg_file, app_file.parent)
+                        tgt = os.path.relpath(env_snap.snap_path / pkg_file, app_file.parent)
                         log.debug("Symlinking %s -> %s", app_file, tgt)
                         app_file.symlink_to(tgt)
         # Link to lock file

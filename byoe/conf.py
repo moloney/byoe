@@ -1,12 +1,12 @@
-import re
-import os, logging, typing
+"""Configuration specification and parsing"""
+import os, logging, typing, re, itertools
 from pathlib import Path
 from enum import Enum
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from urllib.parse import urlparse
 from urllib.request import urlopen
-from typing import ClassVar, Dict, List, Optional, Union, Any
+from typing import Protocol, ClassVar, Dict, List, Optional, Union, Any, Type
 
 import yaml
 import click
@@ -33,19 +33,24 @@ class InvalidConfigError(ConfigError):
     pass
 
 
+class IncludeLoopError(InvalidConfigError):
+    """Raise when a loop is detected in configuration 'include' statements"""
+
+
 def _get_conf_content(base_dir: Path, source: str) -> str:
     """Get text from config file that could be local path or URL"""
     url = urlparse(source)
     if url.scheme in ("", "file"):
         url_path = Path(url.path)
-        if not url_path.absolute:
-            url_path = base_dir / url_path
+        if not url_path.is_absolute():
+            url_path = base_dir / "conf.d" / url_path
         return url_path.read_text()
     else:
         return urlopen(source).read()
 
 
-def _update_nested(base_dict, key, value):
+def _update_conf(base_dict, key, value):
+    """Update a config value, merging with existing value if it is a list / dict"""
     if key not in base_dict:
         base_dict[key] = value
         return
@@ -54,17 +59,48 @@ def _update_nested(base_dict, key, value):
         base_dict[key] += value
     elif isinstance(value, dict) and isinstance(def_val, dict):
         for k, v in value.items():
-            _update_nested(def_val, k, v)
+            _update_conf(def_val, k, v)
     else:
         base_dict[key] = value
 
 
+def _dc_from_conf(cls, conf_data):
+    '''Build a dataclass from configuration dict'''
+    for attr, hint in typing.get_type_hints(cls).items():
+        if attr in conf_data:
+            tgt_class = None
+            if hasattr(hint, "__origin__"):
+                if hint.__origin__ is typing.Union:
+                    for sub_hint in typing.get_args(hint):
+                        if not sub_hint is type(None):
+                            if hasattr(sub_hint, "__origin__"):
+                                tgt_class = sub_hint.__origin__
+                            else:
+                                tgt_class = sub_hint
+                            break
+                else:
+                    tgt_class = hint.__origin__
+            else:
+                tgt_class = hint
+            if hasattr(tgt_class, "from_dict"):
+                conf_data[attr] = tgt_class.from_dict(conf_data[attr])
+            elif issubclass(tgt_class, Enum):
+                conf_data[attr] = tgt_class(conf_data[attr].lower())
+            elif conf_data[attr] is not None and not isinstance(
+                conf_data[attr], tgt_class
+            ):
+                conf_data[attr] = tgt_class(conf_data[attr])
+    res = cls(**conf_data)
+    res._explicitly_set = set(conf_data.keys())
+    return res
+
+
 @dataclass
-class Config:
+class Config(Protocol):
     """Base for specifying config as dataclass"""
 
     def to_dict(self) -> Dict[str, Any]:
-        res = {}
+        res: Dict[str, Any] = {}
         for field in fields(self):
             attr = field.name
             val = getattr(self, attr)
@@ -74,7 +110,7 @@ class Config:
                 res[attr] = str(val)
             elif isinstance(val, Enum):
                 res[attr] = val.value
-            elif isinstance(val, Config):
+            elif hasattr(val, "to_dict"):
                 res[attr] = val.to_dict()
             else:
                 res[attr] = val
@@ -101,7 +137,7 @@ class Config:
                         prev_val = {}
                     res = new_def_val.copy()
                     for k, v in prev_val.items():
-                        _update_nested(res, k, v)
+                        _update_conf(res, k, v)
                     setattr(self, field.name, res)
 
     @classmethod
@@ -111,40 +147,14 @@ class Config:
 
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
-        for attr, hint in typing.get_type_hints(cls).items():
-            if attr in conf_data:
-                tgt_class = None
-                if hasattr(hint, "__origin__"):
-                    if hint.__origin__ is typing.Union:
-                        for sub_hint in typing.get_args(hint):
-                            if not sub_hint is type(None):
-                                if hasattr(sub_hint, "__origin__"):
-                                    tgt_class = sub_hint.__origin__
-                                else:
-                                    tgt_class = sub_hint
-                                break
-                    else:
-                        tgt_class = hint.__origin__
-                else:
-                    tgt_class = hint
-                if issubclass(tgt_class, Config):
-                    conf_data[attr] = tgt_class.from_dict(conf_data[attr])
-                elif issubclass(tgt_class, Enum):
-                    conf_data[attr] = tgt_class(conf_data[attr].lower())
-                elif conf_data[attr] is not None and not isinstance(
-                    conf_data[attr], tgt_class
-                ):
-                    conf_data[attr] = tgt_class(conf_data[attr])
-        res = cls(**conf_data)
-        res._explicitly_set = set(conf_data.keys())
-        return res
+        return _dc_from_conf(cls, conf_data)
 
 
 @dataclass
 class UserConfig(Config):
     """User specific configuration"""
 
-    base_dir: Path = "~/.byoe_repo"
+    base_dir: Path = Path("~/.byoe_repo").expanduser()
 
     channel: UpdateChannel = UpdateChannel.STABLE
 
@@ -196,50 +206,56 @@ class IncludableConfig(Config):
     base_dir: ClassVar[Optional[Path]] = None
 
     @classmethod
-    def filt_include(cls, include_data):
+    def filt_include(cls, include_data: Dict[str, Any]) -> Dict[str, Any]:
         """Subclasses can override this method to modify / filter included data"""
         return include_data
 
-    # TODO: Need support for recursive includes with loop detection here
+    @classmethod
+    def merge_values(cls, key, base_val, top_val):
+        """Subclasses can override this to modify how values are merged"""
+        if isinstance(base_val, (list, tuple)):
+            return base_val + top_val
+        if isinstance(base_val, dict):
+            res = base_val.copy()
+            res = {
+                k : tv if k not in res else cls.merge_values(k, res[k], tv) 
+                for k, tv in top_val.items()
+            }
+            return res
+        else:
+            return top_val
+
+    @classmethod
+    def resolve_includes(cls, conf_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve any include elements in config data"""
+        seen = set()
+        def get_incl(data):
+            includes = data.get("include")
+            if includes is None:
+                return data
+            res = {}
+            for include in includes:
+                if include in seen:
+                    raise IncludeLoopError(f"Include loop detected on: {include}")
+                seen.add(include)
+                res.update(
+                    get_incl(yaml.safe_load(_get_conf_content(cls.base_dir, include)))
+                )
+            res = cls.filt_include(res)
+            for key, val in conf_data.items():
+                if key == "include":
+                    continue
+                if key not in res:
+                    res[key] = val
+                else:
+                    res[key] = cls.merge_values(key, res[key], val)
+            return res
+        return get_incl(conf_data)
+
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
-        # Handle top level includes
-        includes = conf_data.get("include")
-        if includes:
-            include_data = {}
-            for include in includes:
-                include_data.update(
-                    cls.filt_include(
-                        yaml.safe_load(_get_conf_content(cls.base_dir, include))
-                    )
-                )
-            del conf_data["include"]
-            include_data.update(conf_data)
-            conf_data = include_data
-        for attr, hint in typing.get_type_hints(cls).items():
-            if attr in conf_data:
-                tgt_class = None
-                if hasattr(hint, "__origin__") and hint.__origin__ is typing.Union:
-                    for sub_hint in typing.get_args(hint):
-                        if not sub_hint is type(None):
-                            tgt_class = sub_hint
-                            break
-                else:
-                    tgt_class = hint
-                if hasattr(tgt_class, "__origin__"):
-                    # We still have type hint not a class, just punt...
-                    continue
-                if issubclass(tgt_class, IncludableConfig):
-                    conf_data[attr] = tgt_class.from_dict(conf_data[attr])
-                elif issubclass(tgt_class, Config):
-                    conf_data[attr] = tgt_class.from_dict(conf_data[attr])
-                elif issubclass(tgt_class, Enum):
-                    conf_data[attr] = tgt_class(conf_data[attr].lower())
-                elif not isinstance(conf_data[attr], tgt_class):
-                    conf_data[attr] = tgt_class(conf_data[attr])
-        res = cls(**conf_data)
-        res._explicitly_set = set(conf_data.keys())
-        return res
+        conf_data = cls.resolve_includes(conf_data)
+        return _dc_from_conf(cls, conf_data)
 
 
 @dataclass
@@ -249,6 +265,11 @@ class SpackBuildChain(Config):
     compiler: Optional[str] = None
 
     binutils: Optional[str] = None
+
+    target: Optional[str] = None
+
+
+_SPACK_MERGE_STR_SET = frozenset(("variants", "require"))
 
 
 @dataclass
@@ -276,9 +297,17 @@ class SpackConfig(IncludableConfig):
             else:
                 res[field.name] = val
         return res
+    
+    @classmethod
+    def merge_values(cls, key, base_val, top_val):
+        """Specialized `merge_values` concats 'variants' and 'require' strings"""
+        if key in _SPACK_MERGE_STR_SET and isinstance(base_val, str):
+            return " ".join((base_val, top_val))
+        return IncludableConfig.merge_values(key, base_val, top_val)
 
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
+        conf_data = cls.resolve_includes(conf_data)
         build_chains = conf_data.get("build_chains")
         if build_chains:
             conf_data["build_chains"] = [
@@ -288,7 +317,7 @@ class SpackConfig(IncludableConfig):
         res._explicitly_set = set(conf_data.keys())
         return res
 
-    def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
+    def set_defaults(self, defaults: Dict[str, Any]) -> None:
         build_chains = defaults.get("build_chains")
         if build_chains:
             defaults = deepcopy(defaults)
@@ -332,6 +361,17 @@ class CondaConfig(IncludableConfig):
 
 
 @dataclass
+class ApptainerConfig(IncludableConfig):
+    """Apptainer specific configuration for an image"""
+
+    image_spec: str
+
+    inject_nv: bool = False
+
+    inject_rocm: bool = False
+
+
+@dataclass
 class EnvConfig(IncludableConfig):
     """Config for an environment"""
 
@@ -342,6 +382,8 @@ class EnvConfig(IncludableConfig):
     conda: Optional[CondaConfig] = None
 
     extra_activation: Optional[List[str]] = None
+
+    best_effort: bool = False
 
     def __post_init__(self):
         if self.spack is not None and self.conda is not None:
@@ -391,6 +433,36 @@ class PythonAppConfig(IncludableConfig):
 
 
 @dataclass
+class ApptainerAppConfig(IncludableConfig):
+    """Config for an isolated Apptainer app"""
+    apptainer: ApptainerConfig
+    
+    exported: Optional[List[str]] = None
+
+    default: bool = True
+
+    extra_activation: Optional[List[str]] = None
+
+    def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
+        if "apptainer" in defaults:
+            self.apptainer.set_defaults(defaults["apptainer"])
+
+
+
+def get_app_conf(conf_data: Dict) -> Union[CondaAppConfig, PythonAppConfig, ApptainerAppConfig]:
+    app_cls: Union[Type[PythonAppConfig], Type[CondaAppConfig], Type[ApptainerAppConfig]]
+    if "python" in conf_data:
+        app_cls = PythonAppConfig
+    elif "conda" in conf_data:
+        app_cls = CondaAppConfig
+    elif "apptainer" in conf_data:
+        app_cls = ApptainerAppConfig
+    else:
+        raise InvalidConfigError("Configuration isn't valid for an 'app'")
+    return app_cls.from_dict(conf_data)
+
+
+@dataclass
 class SlurmBuildConfig(Config):
     """Config for building on Slurm"""
 
@@ -405,12 +477,19 @@ class SlurmBuildConfig(Config):
     tmp_dir: Optional[Path] = None
 
 
+def _get_n_cpus(na_default: int = 2) -> int:
+    res = os.cpu_count()
+    if res is None:
+        res = na_default
+    return res
+
+
 @dataclass
 class BuildConfig(Config):
     """Config for building environments / apps"""
 
     # TODO: rename to max_local_tasks
-    max_tasks: int = os.cpu_count() // 2
+    max_tasks: int = _get_n_cpus() // 2
 
     tmp_dir: Optional[Path] = None
 
@@ -455,7 +534,7 @@ def get_job_build_info(build_config: Optional[BuildConfig], job_type: str):
         else:
             slurm_conf = build_config.slurm_config
         slurm_info = deepcopy(slurm_conf.get(job_type, SlurmBuildConfig()))
-        slurm_info.set_defaults(slurm_conf.get("default", asdict(SlurmBuildConfig())))
+        slurm_info.set_defaults(asdict(slurm_conf.get("default", SlurmBuildConfig())))
         if slurm_info.tasks_per_job is None:
             slurm_info.tasks_per_job = DEFAULT_SLURM_TASKS
         if slurm_info.tmp_dir is None:
@@ -476,7 +555,10 @@ def get_job_build_info(build_config: Optional[BuildConfig], job_type: str):
 
 @dataclass
 class GlobalSpackConfig(Config):
-    """Spack config that is handled globally (not per env/app)"""
+    """Spack config that is handled globally
+    
+    The `repo_url` and `repo_branch` define the source for Spack itself.
+    """
 
     repo_url: str = "https://github.com/spack/spack.git"
 
@@ -484,12 +566,17 @@ class GlobalSpackConfig(Config):
 
     buildcache_padding: int = 128
 
-    mirrors: Optional[Dict[str, str]] = None
+    mirrors: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @dataclass
 class GlobalCondaConfig(Config):
-    """Conda config that is handled globally"""
+    """Conda config that is handled globally
+    
+    The `source` can be:
+      * The base URL to download prebuilt binaries from
+      * The keyword 'spack' to build with Spack
+    """
 
     source: str = "https://micro.mamba.pm/api/micromamba"
 
@@ -503,26 +590,61 @@ class GlobalCondaConfig(Config):
 
 
 @dataclass
+class GlobalApptainerConfig(Config):
+    """Apptainer config that is handled globally
+    
+    The `source` can be:
+      * The keyword 'system' to use the system installed version
+      * The keyword 'relocatable' to install the relocatable (non-suid) binaries
+      * None to prefer system install but fall back to installing relocatable version
+    """
+    source: Optional[str] = None
+
+    reloc_install_script: str = "https://raw.githubusercontent.com/apptainer/apptainer/main/tools/install-unprivileged.sh"
+
+
+@dataclass
+class WorkSpace(Config):
+    """Explicitly define a named workspace"""
+    name: str
+
+    env: Optional[str] = None
+
+    exclude_apps: List[str] = field(default_factory=list)
+
+    include_apps: List[str] = field(default_factory=list)
+
+    best_effort: bool = False
+
+
+VALID_ENV_APP_NAME = "[a-zA-Z0-9_]+"
+
+
+@dataclass
 class SiteConfig(Config):
-    """Full configuration for a site"""
+    """Full configuration for a repository"""
 
     spack_global: GlobalSpackConfig = field(default_factory=GlobalSpackConfig)
 
     conda_global: GlobalCondaConfig = field(default_factory=GlobalCondaConfig)
 
+    apptainer_global: GlobalApptainerConfig = field(default_factory=GlobalApptainerConfig)
+
     build_opts: BuildConfig = field(default_factory=BuildConfig)
 
     defaults: Optional[Dict[str, Dict[str, Any]]] = None
 
-    apps: Optional[Dict[str, Union[CondaAppConfig, PythonAppConfig]]] = None
+    apps: Optional[Dict[str, Union[CondaAppConfig, PythonAppConfig, ApptainerAppConfig]]] = None
 
     envs: Optional[Dict[str, EnvConfig]] = None
+
+    workspaces: Optional[Dict[str, WorkSpace]] = None
 
     def __post_init__(self):
         app_names = set() if self.apps is None else set(self.apps.keys())
         env_names = set() if self.envs is None else set(self.envs.keys())
         for name in app_names | env_names:
-            if not re.match("[a-zA-Z0-9_]+", name):
+            if not re.match(VALID_ENV_APP_NAME, name):
                 raise InvalidConfigError(f"Invalid env/app name: {name}")
         collisions = app_names & env_names
         if collisions:
@@ -536,7 +658,7 @@ class SiteConfig(Config):
             val = getattr(self, field.name)
             if val is None:
                 continue
-            if field.name in ("apps", "envs"):
+            if field.name in ("apps", "envs", "workspaces"):
                 res[field.name] = {k: v.to_dict() for k, v in val.items()}
             elif field.name != "defaults":
                 res[field.name] = val.to_dict()
@@ -557,18 +679,13 @@ class SiteConfig(Config):
             conf_data["build_opts"] = BuildConfig.from_dict(build_opts)
         apps = conf_data.get("apps")
         if apps:
-            converted = {}
-            for name, app_conf in apps.items():
-                if "conda" in app_conf:
-                    converted[name] = CondaAppConfig.from_dict(app_conf)
-                else:
-                    converted[name] = PythonAppConfig.from_dict(app_conf)
-            conf_data["apps"] = converted
+            conf_data["apps"] = {n : get_app_conf(d) for n, d in apps.items()}
         envs = conf_data.get("envs")
         if envs:
             conf_data["envs"] = {
                 name: EnvConfig.from_dict(env_conf) for name, env_conf in envs.items()
             }
+        # TODO: Handle workspaces
         res = cls(**conf_data)
         res._explicitly_set = set(conf_data.keys())
         return res
@@ -584,3 +701,37 @@ class SiteConfig(Config):
             "Enter the git branch to use for spack", default="develop", type=str
         )
         return cls(GlobalSpackConfig(spack_repo, spack_branch))
+
+
+def get_site_conf(
+    site_conf_path: Path, env_confd: Path, app_confd: Path
+) -> SiteConfig:
+    """Get the full site config, allowing envs / apps to be defined in conf.d dir
+    
+    Also sets defaults on all apps / envs 
+    """
+    # Load base config
+    site_conf = SiteConfig.from_dict(yaml.safe_load(site_conf_path.read_text()))
+    existing_names = set(site_conf.envs) & set(site_conf.apps)
+    # Add any app / env config from the conf.d directory 
+    for conf_path in itertools.chain(env_confd.glob("*.yaml"), app_confd.glob("*.yaml")):
+        name = conf_path.stem
+        if not re.match(VALID_ENV_APP_NAME, name):
+            log.info("Skipping config due to invalid name: %s", name)
+            continue
+        if name in existing_names:
+            raise InvalidConfigError(f"Name collision from conf.d: {name}")
+        existing_names.add(name)
+        conf_data = yaml.safe_load(conf_path.read_text())
+        if conf_path.parent.name == "envs":
+             site_conf.envs[name] = EnvConfig.from_dict(conf_data)
+        else:
+            site_conf.apps[name] = get_app_conf(conf_data)
+    if site_conf.defaults is not None:
+        if site_conf.envs:
+            for env_conf in site_conf.envs.values():
+                env_conf.set_defaults(site_conf.defaults)
+        if site_conf.apps:
+            for app_conf in site_conf.apps.values():
+                app_conf.set_defaults(site_conf.defaults)
+    return site_conf
