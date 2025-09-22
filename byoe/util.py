@@ -1,14 +1,12 @@
-import os, shlex, json, logging
-from datetime import datetime, timedelta
+import os, shlex, json, re, logging
 from pathlib import Path
 from io import TextIOWrapper
-from difflib import unified_diff
-from typing import List, Dict, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple, Union, Callable
 
 import sh # type: ignore
 
 from .globals import ShellType
-from .snaps import SnapId, SnapSpec
 
 
 sh = sh.bake(_tty_out=False)
@@ -22,55 +20,6 @@ except sh.CommandNotFound:
 
 
 log = logging.getLogger(__name__)
-
-
-def select_snap(
-    snap_ids: List[SnapId], period: int, now: Optional[datetime] = None
-) -> SnapId:
-    """Select snapshot date base on the `period` (and `now`)"""
-    if not snap_ids:
-        raise ValueError("Can't select from empty list of `snap_ids`")
-    if now is None:
-        now = datetime.now()
-    if period > 12:
-        if period % 12 != 0:
-            raise ValueError(
-                "Update periods over 12 months must be evenly divisible by 12"
-            )
-        period_yrs = period // 12
-        tgt = datetime(now.year - (now.year % period_yrs), 1, 1)
-    else:
-        if 12 % period != 0:
-            raise ValueError("Update periods under 12 months must evenly divide 12")
-        tgt = datetime(now.year, now.month - ((now.month - 1) % period), 1)
-    by_delta: Dict[timedelta, List[SnapId]] = {}
-    min_delta = None
-    log.debug("Target date is %s Selecting from snap_ids: %s", tgt, snap_ids)
-    for snap_id in snap_ids:
-        delta = abs(snap_id.time_stamp - tgt)
-        if delta not in by_delta:
-            by_delta[delta] = []
-        by_delta[delta].append(snap_id)
-        if min_delta is None or delta < min_delta:
-            min_delta = delta
-    assert min_delta is not None
-    return sorted(by_delta[min_delta])[-1]
-
-
-def get_closest_snap(
-    tgt: SnapId, avail: List[Tuple[SnapSpec, ...]]
-) -> Optional[Tuple[SnapSpec, ...]]:
-    """Select the SnapSpec to use given the `tgt` SnapId"""
-    for idx, snaps in enumerate(avail):
-        if snaps[0].snap_id == tgt:
-            return snaps
-        elif snaps[0].snap_id > tgt:
-            if idx != 0:
-                return avail[idx - 1]
-            return snaps
-    if avail:
-        return avail[-1]
-    return None
 
 
 def get_activated_envrion(
@@ -107,37 +56,129 @@ def get_ssl_env():
 
 
 def get_sh_special(cmd: sh.Command):
-    """Get special kwargs used to create thie command"""
+    """Get special kwargs used to create this command"""
     return {
         f"_{kw}": val if not hasattr(val, "copy") else val.copy()
         for kw, val in cmd._partial_call_args.items()
     }
 
 
+@dataclass
+class StreamHandler:
+    """Handle output stream from an `sh.Command` instance"""
+    log_file: Optional[TextIOWrapper] = None
+
+    callbacks: List[Callable[[str], None]] = field(default_factory=list)
+
+    tee: bool = True
+
+    def __call__(self, data: str) -> None:
+        if self.log_file is not None:
+            self.log_file.write(data)
+        for cb in self.callbacks:
+            cb(data)
+
+    @classmethod
+    def merge(
+        cls, lower: Optional["StreamHandler"], upper: Optional["StreamHandler"]
+    ) -> "StreamHandler":
+        if lower is None:
+            return upper
+        if upper is None:
+            return lower
+        return cls(
+            upper.log_file if upper.log_file is not None else lower.log_file,
+            upper.callbacks + lower.callbacks,
+            upper.tee or lower.tee,
+        )
+
+
+@dataclass
+class RegexCallback:
+    """Callback to find lines matching some expression"""
+    pattern: str
+
+    matches: List[re.Match] = field(default_factory=list)
+
+    max_matches: int = 0
+
+    def __call__(self, data: str) -> None:
+        if self.max_matches and len(self.matches) == self.max_matches:
+            return
+        mtch = re.match(self.pattern, data)
+        if mtch is not None:
+            self.matches.append(mtch)
+
+
 def get_cmd(
     cmd: Union[str, Path, sh.Command],
     env: Optional[Dict[str, str]] = None,
-    log_file: Optional[TextIOWrapper] = None,
+    out_handler: Optional[Union[StreamHandler, TextIOWrapper]] = None,
+    err_handler: Optional[Union[StreamHandler, TextIOWrapper]] = None,
+    err_to_out: Optional[bool] = None,
     ref_cmd: Optional[sh.Command] = None,
-):
-    """Helper to create / modify sh.Command instances with environment mods and logging
-    
-    The environment / logging setting priorities are `env` / `log_file` args > `ref_cmd`
-    attributes > `cmd` attributes (if it is a `sh.Command`). 
+) -> sh.Command:
+    """Helper to create / modify sh.Command instances
+
+    The "special" kwargs for the `sh.Command` being produced (e.g. `_env`, `_out`, 
+    `_err`, etc.) are determined from the `cmd`, then the `ref_cmd`, and finally the 
+    `env` / `out_handler` / `err_handler` / `err_to_out` arguments. 
     """
-    special = {}
+    base_special = ref_special = None
+    handlers = {}
     if isinstance(cmd, sh.Command):
-        special.update(get_sh_special(cmd))
+        base_special = get_sh_special(cmd)
     if ref_cmd is not None:
-        special.update(get_sh_special(ref_cmd))
-    if env:
+        ref_special = get_sh_special(ref_cmd)
+    if base_special is not None:
+        special = base_special
+        handlers["_out"] = base_special.get("_out")
+        handlers["_err"] = base_special.get("_err")
+        if ref_special is not None:
+            special.update(ref_special)
+            if "_out" in ref_special and handlers["_out"] is not None:
+                special["_out"] = StreamHandler.merge(handlers["_out"], ref_special["_out"])
+            if "_err" in ref_special and handlers["_err"] is not None:
+                special["_err"] = StreamHandler.merge(handlers["_err"], ref_special["_err"])
+    elif ref_special is not None:
+        special = ref_special
+    else:
+        special = {}
+    if env is not None:
         if "_env" not in special:
             special["_env"] =  {}
         special["_env"].update(env)
-    if log_file:
-        special["_out"] = log_file
-        special["_err"] = log_file
-        special["_tee"] = {"err", "out"}
+    if out_handler is not None:
+        if not isinstance(out_handler, StreamHandler):
+            out_handler = StreamHandler(out_handler)
+        if "_out" in special:
+            special["_out"] = StreamHandler.merge(special["_out"], out_handler)
+        else:
+            special["_out"] = out_handler
+    if err_handler is not None:
+        if not isinstance(err_handler, StreamHandler):
+            err_handler = StreamHandler(err_handler)
+        if "_err" in special:
+            special["_err"] = StreamHandler.merge(special["_err"], err_handler)
+        else:
+            special["_err"] = err_handler
+    if err_to_out is not None:
+        if err_to_out:
+            if "_err" in special:
+                raise ValueError("Can't set both err_to_out and pass err_handler")
+            special["_err_to_out"] = True
+        elif "_err_to_out" in special:
+            del special["_err_to_out"]
+    elif "_err" in special:
+        if "_err_to_out" in special:
+            del special["_err_to_out"]
+    tee = set()
+    if "_out" in special and special["_out"].tee:
+        tee.add("out")
+    if "_err" in special and special["_err"].tee:
+        tee.add("err")
+    if tee:
+        special["_tee"] = tee
     if isinstance(cmd, sh.Command):
         cmd = cmd.bake(**special)
     else:

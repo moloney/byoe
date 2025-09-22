@@ -1,5 +1,5 @@
 """Manage apptainer images / apps"""
-import logging, json, os, io, shutil
+import logging, json, os, re
 from pathlib import Path
 from hashlib import blake2b
 from typing import Dict, Optional, Any
@@ -10,7 +10,7 @@ import requests
 
 from .globals import EnvType, ShellType, LOCK_SUFFIXES
 from .snaps import SnapId, SnapSpec
-from .util import make_app_act_script, get_cmd, srun_wrap
+from .util import get_sh_special, get_cmd, srun_wrap, RegexCallback, StreamHandler, make_app_act_script
 from .conf import ApptainerConfig, ApptainerAppConfig, BuildConfig, get_job_build_info
 
 
@@ -71,13 +71,23 @@ def update_apptainer_env(
     build_config: BuildConfig,
 ) -> SnapSpec:
     """Create updated snapshot of apptainer environment (image)"""
-    # Setup commands we need with build configuration
+    # Setup build command, including parser for extracting image SHA digest
     apptainer_build = get_apptainer_build(
         apptainer, get_job_build_info(build_config, "apptainer_build")
     )
     apptainer_inspect = get_apptainer_inspect(
         apptainer, get_job_build_info(build_config, "apptainer_inspect")
     )
+    image_spec = apptainer_config.image_spec
+    digest_parser = RegexCallback(
+        fr".+ source image digest for {re.escape(image_spec)} is ([a-f0-9]+)\s*", 
+        max_matches=1
+    )
+    handler = StreamHandler.merge(
+        StreamHandler(callbacks=[digest_parser]), 
+        get_sh_special(apptainer_build).get("_out"),
+    )
+    apptainer_build = get_cmd(apptainer_build, err_handler=handler)
     # Build the image
     image_path = locs["envs"] / "apptainer" / env_name / f"{snap_id}.sif"
     lock_file = image_path.parent / f"{image_path.stem}.def"
@@ -88,36 +98,43 @@ def update_apptainer_env(
         args.append("--nv")
     if apptainer_config.inject_rocm:
         args.append("--rocm")
-    args += [str(image_path), apptainer_config.image_spec]
+    args += [str(image_path), image_spec]
     try:
         apptainer_build(*args)
     except sh.ErrorReturnCode:
-        log.error("Error during apptainer image build for: %s", env_name)
+        log.exception("Error during apptainer image build for: %s", env_name)
         snap.stash_failed()
         raise
     # Create a more specifc "deffile" as the "lock file"
+    if not digest_parser.matches:
+        snap.stash_failed()
+        raise ValueError(f"Unable to extract apptainer image digest for: {image_spec}")
+    img_digest = digest_parser.matches[0].group(1)
     try:
         img_data = json.loads(apptainer_inspect(["--json", "--all", str(image_path)]))
         img_attrs = img_data["data"]["attributes"]
         labels = img_attrs["labels"]
-        img_vers = labels["org.label-schema.version"]
-        vcs_str = ":".join([
-            labels.get("org.label-schema.vcs-url", ""),
-            labels.get("org.label-schema.vcs-ref", ""),
-        ])
+        img_vers = labels.get("org.label-schema.version", "")
+        vcs_url = labels.get("org.label-schema.vcs-url", "")
+        vcs_ref = labels.get("org.label-schema.vcs-ref", "")
+        if not vcs_url and "GITHUB_REPOSITORY" in labels:
+            vcs_url = f"https://github.com/{labels['GITHUB_REPOSITORY']}"
+            vcs_ref = labels.get("GITHUB_SHA", "")    
         snap = SnapSpec.from_lock_path(lock_file)
         with lock_file.open("w") as f:
-            # Currently it doesn't appear possible to build images based on a label or a 
-            # hash in apptainer (or even get an image hash?), so we save info about the 
-            # VCS commit in a comment and install based on the version
-            f.write(f"# VCS Info = {vcs_str}\n")
+            if img_vers:
+                f.write(f"# Version = {img_vers}\n")
+            if vcs_url:
+                f.write(f"# VCS Info = {vcs_url}:{vcs_ref}\n")
             for line in img_attrs["deffile"].split("\n"):
                 if line.startswith("from: "):
                     # Replace potentially non-specific version with exact version
                     toks = line[6:].split(":")
                     img = toks[0]
-                    line = f"from: {img}:{img_vers}\n"
-                f.write(line)
+                    if '@' in img:
+                        img = img.split('@')[0]
+                    line = f"from: {img}@sha256:{img_digest}\n"
+                f.write(line + "\n")
         snap.dedupe()
     except Exception:
         log.error("Error while building apptainer lock file: %s", lock_file)
@@ -135,6 +152,7 @@ _APPTAINER_EXEC_WRAP_SCRIPT = """\
 #!/bin/sh
 apptainer exec {img} {cmd} "$@"
 """
+
 
 def update_apptainer_app(
     app_name: str,
@@ -155,25 +173,29 @@ def update_apptainer_app(
     )
     app_dir = locs["apps"] / "apptainer" / app_name / str(snap_id)
     bin_dir = app_dir / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    if app_config.exported is None:
-        app_file = bin_dir / app_name
-        app_file.write_text(_APPTAINER_RUN_WRAP_SCRIPT.format(img=env_snap.snap_path))
-        app_file.chmod(app_file.stat().st_mode | 0o000550)
-    else:
-        for exec_name in app_config.exported:
-            app_file = bin_dir / exec_name
-            app_file.write_text(
-                _APPTAINER_EXEC_WRAP_SCRIPT.format(img=env_snap.snap_path, cmd=exec_name)
-            )
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        if app_config.exported is None:
+            app_file = bin_dir / app_name
+            app_file.write_text(_APPTAINER_RUN_WRAP_SCRIPT.format(img=env_snap.snap_path))
             app_file.chmod(app_file.stat().st_mode | 0o000550)
-    lock_path = (
-        locs["apps"] / "apptainer" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.APPTAINER]}"
-    )
-    lock_path.symlink_to(os.path.relpath(env_snap.lock_file, lock_path.parent))
-    # Make app activation scripts
-    app_snap = SnapSpec.from_lock_path(lock_path)
-    for shell_type in ShellType:
-        act_path = app_snap.get_activate_path(shell_type)
-        act_path.write_text(make_app_act_script(app_dir, shell_type))
+        else:
+            for exec_name in app_config.exported:
+                app_file = bin_dir / exec_name
+                app_file.write_text(
+                    _APPTAINER_EXEC_WRAP_SCRIPT.format(img=env_snap.snap_path, cmd=exec_name)
+                )
+                app_file.chmod(app_file.stat().st_mode | 0o000550)
+        lock_path = (
+            locs["apps"] / "apptainer" / app_name / f"{snap_id}{LOCK_SUFFIXES[EnvType.APPTAINER]}"
+        )
+        lock_path.symlink_to(os.path.relpath(env_snap.lock_file, lock_path.parent))
+        # Make app activation scripts
+        app_snap = SnapSpec.from_lock_path(lock_path)
+        for shell_type in ShellType:
+            act_path = app_snap.get_activate_path(shell_type)
+            act_path.write_text(make_app_act_script(app_dir, shell_type))
+    except:
+        log.error("Error building snap for app: %s", app_name)
+        raise
     return app_snap

@@ -18,6 +18,7 @@ from .byoe import NoCompilerFoundError, ByoeRepo
 
 log = logging.getLogger("byoe")
 
+success_console = Console(style="green")
 
 error_console = Console(stderr=True, style="bold red")
 
@@ -72,21 +73,30 @@ def main(
     if "user" not in conf_data:
         if sys.stdout.isatty():
             conf_data["user"] = UserConfig.build_interactive()
-            conf_path.parent.mkdir(exist_ok=True)
+            conf_path.parent.mkdir(parents=True, exist_ok=True)
             conf_path.write_text(yaml.dump(conf_data["user"].to_dict()))
         else:
             error_console.print("No user config at: {conf_path}")
 
 
+def _get_success_intro_msg(repo):
+    return f"""
+[bold green]Success:[/bold green] Add config files under {repo._locs["confd"]}
+or modify  {repo._base_dir}/site_conf.yaml and place any needed license 
+files in {repo._locs["licenses"]} before running the [bold magenta]update[/bold magenta] command
+"""
+
+
 @cli.command(rich_help_panel="Admin Commands")
-def init_dir(
+def prep_repo(
     pull_spack: bool = True,
+    pull_spack_packages: bool = True,
     log_path: Optional[Path] = None,
 ):
     """Prepare the configured base directory, including fetching and updating spack repo
 
-    Calling this is optional, mostly useful if you want to prepopulate some sub
-    directories (e.g. licenses) before calling 'update_envs'.
+    Gemerally this is just called once to setup a new repo, but it can be used to update
+    spack and spack-packages without modifying any BYOE envs / apps.
     """
     if not conf_data:
         error_console.print("Unable to find config")
@@ -103,16 +113,18 @@ def init_dir(
     root_logger.addHandler(file_handler)
     repo = ByoeRepo(conf_data["user"].base_dir)
     try:
-        repo.prep_dir(pull_spack, log_file)
+        repo.prep_dir(pull_spack, pull_spack_packages, log_file)
     except NoCompilerFoundError:
         error_console.print("No system compiler found, install one and rerun.")
         return 1
+    success_console.print(_get_success_intro_msg(repo))
 
 
 @cli.command(rich_help_panel="Admin Commands")
 def update(
     env_or_app: Annotated[Optional[List[str]], typer.Argument()] = None,
     pull_spack: bool = True,
+    pull_spack_packages: bool = True,
     label: Optional[str] = None,
     log_path: Optional[Path] = None,
 ):
@@ -137,6 +149,7 @@ def update(
         repo.update(
             env_or_app,
             pull_spack=pull_spack,
+            pull_spack_packages=pull_spack_packages,
             label=label,
             log_file=log_file,
         )

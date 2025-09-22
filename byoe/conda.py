@@ -191,7 +191,7 @@ def update_conda_app(
     app_dir.mkdir(parents=True)
     try:
         for spec in app_config.conda.specs:
-            mtch = re.match("([^\s<>=~!]+).*", spec)
+            mtch = re.match(r"([^\s<>=~!]+).*", spec)
             assert mtch is not None
             pkg_name = mtch.groups()[0]
             pkg_filt = None

@@ -6,8 +6,8 @@ Build and manage rolling releases of modern, reproducible, scientific software s
 with a focus on HPC.
 
 Combines the package ecosystems of `Spack <https://spack.io/>`_, 
-`Conda <https://docs.conda.io/en/latest/>`_, `PYPI <https://pypi.org/>`_, and 
-`Apptainer <https://apptainer.org/>` to provide a huge amount up-to-date software. 
+`Conda <https://docs.conda.io/en/latest/>`_, `PyPI <https://pypi.org/>`_, and 
+`Apptainer <https://apptainer.org/>`_ to provide a huge amount up-to-date software. 
 Each `byoe` workspace can define one base `environemnt` (using `spack` + `pypi` or 
 `conda`) plus any number of standalone `apps` (using any of the package ecosystems). 
 Within the base `environment` all of the software must be able to coexist with no 
@@ -30,12 +30,12 @@ system libraries or compile alternative versions of them. While some python pack
 available in Spack most are not, and it only makes sense to use Spack to build Python
 packages that need to link to custom built libraries or that may see a performance boost 
 from custom compilation. Therefore we allow Python virutal environments to be layered on 
-top of spack environments to provide access to the full PYPI package ecosystem. 
+top of spack environments to provide access to the full PyPI package ecosystem. 
 
 The use of Conda does not allow for integration with system libraries or custom 
 compilation, but installing Conda packages is generally faster and more reliable that 
 Spack since we are just downloading prebuilt binaries. Conda has builtin support for 
-installing from `PYPI`.
+installing from `PyPI`.
 
 Supports compiling software with spack on a Slurm cluster. All packages are cached to 
 avoid repeating work, and these caches are available to users to speed up their own 
@@ -47,7 +47,7 @@ Install
 Prerequisites
 -------------
 
-The only things that must be avaiable ahead of time are ``git`` and a compiler 
+The only things that must be available ahead of time are ``git`` and a compiler 
 toolchain. For example on a Debian/Ubuntu system you may need to run:
 
 ..

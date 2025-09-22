@@ -1,16 +1,16 @@
 """Snapshot tracking"""
 import logging, re, json, os, shutil
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from functools import cached_property
 from hashlib import blake2b
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
-
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 import yaml
 
 from .globals import ENV_SUFFIXES, LOCK_SUFFIXES, TS_FORMAT, EnvType, ShellType, SnapType
+from .conf import EnvConfig, _AppConfig, get_app_conf, SpackConfig, CondaConfig, PythonConfig, ApptainerConfig
 
 
 log = logging.getLogger(__name__)
@@ -94,10 +94,12 @@ class SnapSpec:
 
     snap_type: SnapType
 
+    _config: Optional[Union[EnvConfig, _AppConfig]] = field(default=None)
+
     def __postinit__(self):
         if self.snap_type == SnapType.ENV:
             env_suffix = ENV_SUFFIXES.get(self.env_type)
-            if env_suffix and not self.snap_path.endswith(env_suffix):
+            if env_suffix and not self.snap_path.name.endswith(env_suffix):
                 raise ValueError(f"The 'snap_path' doesn't have the required suffix: {env_suffix}")
 
     def __lt__(self, other: "SnapSpec"):
@@ -141,6 +143,21 @@ class SnapSpec:
     @property
     def lock_hash_link(self) -> Path:
         return self.lock_hash_dir / self.lock_hash
+    
+    @property
+    def config_path(self) -> Path:
+        return self.snap_path.parent / f"{self.snap_id}-config.yaml"
+    
+    @property
+    def config(self) -> Union[EnvConfig, _AppConfig]:
+        if self._config is None:
+            with self.config_path.open("r") as fp:
+                data = yaml.safe_load(fp)
+            if self.snap_type is SnapType.APP:
+                object.__setattr__(self, "_config", get_app_conf(data))
+            else:
+                object.__setattr__(self, "_config", EnvConfig.from_dict(data))
+        return self._config
 
     @property
     def is_canon(self) -> bool:
@@ -261,6 +278,8 @@ class SnapSpec:
             return
         env_dir = self.snap_path.parent
         stash_dir = env_dir / f".failed_{self.snap_id}"
+        if stash_dir.exists():
+            stash_dir = env_dir / f".failed_{self.snap_id}-{datetime.now().isoformat()}"
         stash_dir.mkdir()
         log.info("Stashing files associated with failed update to: %s", stash_dir)
         stashed = set()
@@ -321,3 +340,51 @@ class SnapSpec:
             )
         return cls.from_lock_path(new_lock)
 
+
+def select_snap(
+    snap_ids: List[SnapId], period: int, now: Optional[datetime] = None
+) -> SnapId:
+    """Select snapshot date base on the `period` (and `now`)"""
+    if not snap_ids:
+        raise ValueError("Can't select from empty list of `snap_ids`")
+    if now is None:
+        now = datetime.now()
+    if period > 12:
+        if period % 12 != 0:
+            raise ValueError(
+                "Update periods over 12 months must be evenly divisible by 12"
+            )
+        period_yrs = period // 12
+        tgt = datetime(now.year - (now.year % period_yrs), 1, 1)
+    else:
+        if 12 % period != 0:
+            raise ValueError("Update periods under 12 months must evenly divide 12")
+        tgt = datetime(now.year, now.month - ((now.month - 1) % period), 1)
+    by_delta: Dict[timedelta, List[SnapId]] = {}
+    min_delta = None
+    log.debug("Target date is %s Selecting from snap_ids: %s", tgt, snap_ids)
+    for snap_id in snap_ids:
+        delta = abs(snap_id.time_stamp - tgt)
+        if delta not in by_delta:
+            by_delta[delta] = []
+        by_delta[delta].append(snap_id)
+        if min_delta is None or delta < min_delta:
+            min_delta = delta
+    assert min_delta is not None
+    return sorted(by_delta[min_delta])[-1]
+
+
+def get_closest_snap(
+    tgt: SnapId, avail: List[Tuple[SnapSpec, ...]]
+) -> Optional[Tuple[SnapSpec, ...]]:
+    """Select the SnapSpec to use given the `tgt` SnapId"""
+    for idx, snaps in enumerate(avail):
+        if snaps[0].snap_id == tgt:
+            return snaps
+        elif snaps[0].snap_id > tgt:
+            if idx != 0:
+                return avail[idx - 1]
+            return snaps
+    if avail:
+        return avail[-1]
+    return None

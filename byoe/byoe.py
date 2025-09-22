@@ -9,7 +9,7 @@ from io import TextIOWrapper
 from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union, Any
 
 import yaml
 import sh # type: ignore
@@ -23,14 +23,10 @@ from .globals import (
     UpdateChannel,
     ShellType,
 )
-from .snaps import SnapId, SnapSpec, InvalidSnapIdError
-from .util import (
-    get_closest_snap,
-    get_ssl_env,
-    select_snap,
-    get_cmd,
-    get_activated_envrion,
+from .snaps import (
+    SnapId, SnapSpec, InvalidSnapIdError, select_snap, get_closest_snap
 )
+from .util import get_ssl_env, get_cmd, get_activated_envrion
 from .conf import (
     CondaAppConfig, 
     PythonAppConfig, 
@@ -40,12 +36,12 @@ from .conf import (
     get_site_conf
 )
 from .spack import (
+    get_extern_compilers,
     get_spack_install,
     get_spack_pkg_cmds,
     get_spack_env_cmds,
+    install_toolchain,
     update_spack_env,
-    get_compilers,
-    setup_build_chains,
 )
 from .python_venv import update_python_env, update_python_app
 from .conda import fetch_prebuilt, update_conda_app, update_conda_env
@@ -72,6 +68,34 @@ if [ -z "${{BYOE_ENV_DISABLE_PROMPT:-}}" ] ; then
 fi
 """
 
+def _get_git_repo(
+    dest: Path, 
+    url: str, branch: Optional[str] = None, 
+    update_existing: bool = True,
+):
+    """Clone / update (through hard reset!) from git repo"""
+    if not (dest / ".git").exists():
+        log.info("Cloning %s into: %s", url, dest)
+        kwargs = {}
+        if branch:
+            kwargs["branch"] = branch
+        git.clone(url, dest, **kwargs)
+    elif update_existing:
+        # TODO: Should detect / handle changes to branch (and url)
+        log.info("Updating local version of spack repo")
+        git("--git-dir", f"{dest / '.git'}", "fetch")
+        tgt = "origin"
+        if branch:
+            tgt = f"origin/{branch}"
+        git(
+            "--git-dir",
+            f"{dest / '.git'}",
+            "--work-tree",
+            str(dest),
+            "reset",
+            "--hard",
+            tgt,
+        )
 
 # TODO: Need to support external directory with env / apps for situations like users
 #       importing a "workspace"
@@ -97,6 +121,8 @@ class ByoeRepo:
             "licenses" : base_dir / "licenses",
             "internal" : base_dir / internal_dir,
             "spack" : internal_dir / "spack",
+            "spack_packages" : internal_dir / "spack-packages",
+            "spack_bootstrap" : internal_dir / "spack_bootstrap",
             "conda" : internal_dir / "conda",
             "pipx" : internal_dir / "pipx",
             "apptainer" : internal_dir / "apptainer",
@@ -118,6 +144,7 @@ class ByoeRepo:
             "tmp",
             "licenses",
             "internal",
+            "spack_bootstrap",
             "envs",
             "apps",
             "pkg_cache",
@@ -143,7 +170,6 @@ class ByoeRepo:
         if not os.access(base_dir / "site_conf.yaml", os.W_OK):
             log.debug("User doesn't have write access to repo")
             return
-        
         # Symlink the 'byoe' cli entry point into the bin dir
         self_bin = self._locs["bin"] / "byoe"
         if not self_bin.exists():
@@ -164,36 +190,25 @@ class ByoeRepo:
         return self._base_dir
 
     def prep_dir(
-        self, pull_spack: bool = True, log_file: Optional[TextIOWrapper] = None
+        self, 
+        pull_spack: bool = True, 
+        pull_spack_packages: bool = True, 
+        log_file: Optional[TextIOWrapper] = None,
     ) -> None:
         """Perform any baseline setup, particularly installing/updating spack"""
         if self._is_prepped:
             return
-        # Create / update spack git repo
-        branch = self._site_conf.spack_global.repo_branch
+        # Create / update both spack and spack-packages from git
         spack_dir = self._locs["spack"]
-        if not (spack_dir / ".git").exists():
-            log.info("Cloning spack into: %s", spack_dir)
-            kwargs = {}
-            if branch:
-                kwargs["branch"] = branch
-            git.clone(self._site_conf.spack_global.repo_url, spack_dir, **kwargs)
-        elif pull_spack:
-            # TODO: Should detect / handle changes to branch (and repo)
-            log.info("Updating local version of spack repo")
-            git("--git-dir", f"{spack_dir / '.git'}", "fetch")
-            tgt = "origin"
-            if branch:
-                tgt = f"origin/{branch}"
-            git(
-                "--git-dir",
-                f"{spack_dir / '.git'}",
-                "--work-tree",
-                str(spack_dir),
-                "reset",
-                "--hard",
-                tgt,
-            )
+        spack_global = self._site_conf.spack_global
+        _get_git_repo(spack_dir, spack_global.repo_url, spack_global.repo_branch, pull_spack)
+        spack_pkg_dir = self._locs["spack_packages"]
+        _get_git_repo(
+            spack_pkg_dir, 
+            spack_global.pkg_repo_url, 
+            spack_global.pkg_repo_branch, 
+            pull_spack_packages
+        )
         # Link byoe "licenses" dir into spack
         spack_lic_dir = spack_dir / "etc" / "spack" / "licenses"
         if not spack_lic_dir.exists():
@@ -202,8 +217,11 @@ class ByoeRepo:
             )
         # Create / update global spack config
         spack_global_config_path = spack_dir / "etc" / "spack"
-        (spack_global_config_path / "config.yaml").write_text(
-            yaml.dump({"config": {"install_tree": {"padded_length": 128}}})
+        spack_global.write_global_spack_conf(spack_global_config_path)
+        # Configure spack to use our package repo
+        repos = {"builtin": {"destination" : str(spack_pkg_dir)}}
+        (spack_global_config_path / "repos.yaml").write_text(
+            yaml.dump({"repos": repos})
         )
         # Configure default spack mirror
         mirrors = self._site_conf.spack_global.mirrors
@@ -224,7 +242,9 @@ class ByoeRepo:
             "comment": "Generated internally by BYOE for signing packages",
         }
         key_mtch = re.search(
-            r"^\s+([0-9A-Z]+)\s+uid\s+(\[.+\])?\s*byoe_build\s.+", spack.gpg.list(), flags=re.MULTILINE
+            r"^\s+([0-9A-Z]+)\s+uid\s+(\[.+\])?\s*byoe_build\s.+", 
+            spack.gpg.list(), 
+            flags=re.MULTILINE,
         )
         if not key_mtch:
             kwargs = {}
@@ -246,13 +266,18 @@ class ByoeRepo:
         #     spack.gpg.trust(gpg_info)
         # Make sure spack is bootstrapped
         log.info("Bootstrapping spack")
+        spack.bootstrap.root(self._locs["spack_bootstrap"], scope="site")
         spack.bootstrap.now()
         # We keep an updated list of system compilers in the spack site config
         log.info("Checking for system compilers")
         spack.compiler.find(scope="site")
-        sys_compilers = get_compilers(spack)
+        # TODO: Should probably select a default "system" compiler as a toolchain
+        #       here. Prefer compilers with fortran support, then prefer certain
+        #       prefix paths?
+        sys_compilers = get_extern_compilers(spack)
         if len(sys_compilers) == 0:
             raise NoCompilerFoundError()
+        log.debug("Found extern compilers: %s", sys_compilers)
         self._is_prepped = True
 
     def _get_spack(
@@ -276,7 +301,7 @@ class ByoeRepo:
         )
         # Handle alt locations for SSL/TLS certs in case we are using PBS python
         env_data.update(get_ssl_env())
-        spack = get_cmd(self._locs["spack"] / "bin" / "spack", env_data, log_file)
+        spack = get_cmd(self._locs["spack"] / "bin" / "spack", env_data, log_file, log_file)
         act_scripts = []
         if modules:
             act_scripts.append(spack.load("--first", "--sh", *modules))
@@ -291,12 +316,21 @@ class ByoeRepo:
         self,
         env: Optional[Path] = None,
         modules: Optional[List[str]] = None,
-        pull_spack: bool = True,
+        pull_spack: bool = False,
+        pull_spack_packages: bool = False,
         log_file: Optional[TextIOWrapper] = None,
     ) -> sh.Command:
         """Get internal 'spack' command"""
-        self.prep_dir(pull_spack=pull_spack)
+        self.prep_dir(pull_spack=pull_spack, pull_spack_packages=pull_spack_packages)
         return self._get_spack(env, modules, log_file)
+    
+    def install_spack_toolchains(self, spack: sh.Command):
+        """Ensure all spack toolchains are installed"""
+        conf = self._site_conf
+        spack_global = conf.spack_global
+        for tc_name, tc in spack_global.toolchains.items():
+            log.debug("Ensuring Spack toolchain '%s' is installed", tc_name)
+            install_toolchain(spack, tc, self._locs["tmp"], conf.build_opts)
 
     def get_python(
         self,
@@ -309,7 +343,7 @@ class ByoeRepo:
         else:
             env_data = base_env.copy()
         env_data.update(get_ssl_env())
-        return get_cmd(sys.executable, env_data, log_file=log_file)
+        return get_cmd(sys.executable, env_data, log_file, log_file)
 
     def get_pipx(
         self,
@@ -326,10 +360,10 @@ class ByoeRepo:
         venv_env = get_activated_envrion(
             [act_path.read_text()], python._partial_call_args["env"]
         )
-        pip = get_cmd("pip", venv_env, log_file)
+        pip = get_cmd("pip", venv_env, log_file, log_file)
         if not any(x.startswith("pipx") for x in pip.freeze().split("\n")):
             pip.install("pipx")
-        return get_cmd("pipx", venv_env, log_file)
+        return get_cmd("pipx", venv_env, log_file, log_file)
 
     def get_conda_lock(
         self,
@@ -351,11 +385,11 @@ class ByoeRepo:
             ],
             python._partial_call_args["env"],
         )
-        pip = get_cmd("pip", venv_env, log_file)
+        pip = get_cmd("pip", venv_env, log_file, log_file)
         # TODO: Some sort of update mechanism?
         if not any(x.startswith("conda-lock") for x in pip.freeze().split("\n")):
             pip.install("conda-lock")
-        return get_cmd("conda-lock", venv_env, log_file)
+        return get_cmd("conda-lock", venv_env, log_file, log_file)
 
     def get_micromamba(self, log_file: Optional[TextIOWrapper] = None) -> sh.Command:
         """Get internal 'micromamba' command"""
@@ -404,6 +438,7 @@ class ByoeRepo:
             "micromamba",
             get_activated_envrion([mamba_act_text]),
             log_file,
+            log_file,
         ).bake(no_rc=True, yes=True)
     
     def get_apptainer(self, log_file: Optional[TextIOWrapper] = None) -> sh.Command:
@@ -414,7 +449,7 @@ class ByoeRepo:
         cmd = None
         if config.source in ("system", None):
             try:
-                cmd = get_cmd("apptainer", env, log_file).bake(debug=True)
+                cmd = get_cmd("apptainer", env, log_file, log_file).bake(debug=True)
             except sh.CommandNotFound:
                 if config.source == "system":
                     raise
@@ -430,6 +465,7 @@ class ByoeRepo:
         self,
         env_name: str,
         snap_id: SnapId,
+        spack: Optional[sh.Command] = None,
         log_file: Optional[TextIOWrapper] = None,
     ) -> Tuple[Dict[EnvType, SnapSpec], bool]:
         """Create new snapshot of an environment"""
@@ -438,7 +474,7 @@ class ByoeRepo:
         snaps: Dict[EnvType, SnapSpec] = {}
         no_errors = True
         if env_conf.spack:
-            spack = self.get_spack(log_file=log_file)
+            assert spack is not None
             try:
                 snap, no_errors = update_spack_env(
                     spack,
@@ -493,26 +529,30 @@ class ByoeRepo:
                 if not py_no_errors:
                     no_errors = False
         elif env_conf.conda:
-            snaps[EnvType.CONDA] = update_conda_env(
-                env_name,
-                env_conf.conda,
-                self.get_conda_lock(log_file=log_file),
-                self.get_micromamba(log_file=log_file),
-                self._locs,
-                snap_id,
-            )
+            try:
+                snaps[EnvType.CONDA] = update_conda_env(
+                    env_name,
+                    env_conf.conda,
+                    self.get_conda_lock(log_file=log_file),
+                    self.get_micromamba(log_file=log_file),
+                    self._locs,
+                    snap_id,
+                )
+            except:
+                return (snaps, False)
         return (snaps, no_errors)
 
     def _build_app_snap(
         self,
         app_name: str,
         snap_id: SnapId,
+        spack: Optional[sh.Command] = None,
         log_file: Optional[TextIOWrapper] = None,
     ) -> Optional[SnapSpec]:
         assert self._site_conf.apps is not None and app_name in self._site_conf.apps
         app_conf = self._site_conf.apps[app_name]
         if isinstance(app_conf, PythonAppConfig):
-            spack = self.get_spack(log_file=log_file)
+            assert spack is not None
             spack_install = get_spack_install(
                 spack, self._locs["tmp"], build_config=self._site_conf.build_opts
             )
@@ -549,7 +589,6 @@ class ByoeRepo:
                 spack_env.remove(keep_lock=False)
             return res
         elif isinstance(app_conf, CondaAppConfig):
-            assert isinstance(app_conf, CondaAppConfig)
             return update_conda_app(
                 app_name,
                 app_conf,
@@ -573,28 +612,55 @@ class ByoeRepo:
         self,
         envs_or_apps: Optional[List[str]] = None,
         pull_spack: bool = True,
+        pull_spack_packages: bool = True,
         label: Optional[str] = None,
         log_file: Optional[TextIOWrapper] = None,
     ):
-        """Perform updates to configured environments and apps"""
+        """Create updated snaps for configured environments and apps"""
         conf = self._site_conf
-        if conf.envs is None and conf.apps is None:
+        envs = list(conf.envs.keys())
+        apps = list(conf.apps.keys())
+        if envs_or_apps is not None:
+            envs = [x for x in envs if x in envs_or_apps]
+            apps = [x for x in apps if x in envs_or_apps]
+        if len(envs) + len(apps) == 0:
             log.warning("Nothing to do, no 'envs' or 'apps' defined")
             return
-        envs = [] if conf.envs is None else list(conf.envs.keys())
-        apps = [] if conf.apps is None else list(conf.apps.keys())
+        # Determine which package types are being used
+        pkg_types: Set[str] = set()
+        for name in envs + apps:
+            spec = conf.envs.get(name, conf.apps.get(name))
+            for pkg_type in ("spack", "python", "conda", "apptainer"):
+                if hasattr(spec, pkg_type) and getattr(spec, pkg_type) is not None:
+                    pkg_types.add(pkg_type)
+        if "conda" in pkg_types and conf.conda_global.source == "spack":
+            pkg_types.add("spack")
+        if "apptainer" in pkg_types and conf.apptainer_global.source == "spack":
+            pkg_types.add("spack")
+        log.debug("Update uses package types: %s", pkg_types)
+        # TODO: Separate out prep by package type and only do what is needed
+        self.prep_dir(pull_spack, pull_spack_packages)
+        # Make sure any spack build toolchains are installed
+        if "spack" in pkg_types:
+            spack = self._get_spack(log_file=log_file)
+            if conf.spack_global.toolchains:
+                self.install_spack_toolchains(spack)
+        else:
+            spack = None
+        # Allocate snapshot ID
         snap_id, reserve_path = self._allocate_snap_id(label=label)
         log.info("Using snap id: %s", snap_id)
+        # Track the result of trying to update each env / app
         success = []
         partial = []
         failed = []
         try:
-            self.prep_dir(pull_spack)
+            self.prep_dir(pull_spack, pull_spack_packages)
             env_snaps = {}
             for env_name in envs:
                 if envs_or_apps is not None and env_name not in envs_or_apps:
                     continue
-                snaps, no_errors = self._build_env_snap(env_name, snap_id, log_file)
+                snaps, no_errors = self._build_env_snap(env_name, snap_id, spack, log_file)
                 if len(snaps) == 0:
                     failed.append(env_name)
                 else:
@@ -607,7 +673,7 @@ class ByoeRepo:
             for app_name in apps:
                 if envs_or_apps is not None and app_name not in envs_or_apps:
                     continue
-                app_snaps[app_name] = self._build_app_snap(app_name, snap_id, log_file)
+                app_snaps[app_name] = self._build_app_snap(app_name, snap_id, spack, log_file)
             (self._locs["envs"] / f"{snap_id}-site_conf.yaml").write_text(
                 yaml.dump(self._site_conf.to_dict())
             )
@@ -618,6 +684,7 @@ class ByoeRepo:
             log.warning("Parital failure updating envs/apps: %s", ", ".join(partial))
         if failed:
             log.error("Failure updating envs/apps: %s", ", ".join(failed))
+        return success, partial, failed
 
     def get_snaps(
         self, snap_type: SnapType, name: str, exists_only: bool = True
@@ -690,66 +757,16 @@ class ByoeRepo:
             raise ValueError(f"Env snap was deleted: {env_snaps[0]}")
         return env_snaps
     
-    def _make_act_script(
-        self,
-        snap_id: SnapId,
-        env_name: str,
-        env_snaps: Tuple[SnapSpec, ...],
-        enable: List[str],
-        snap_conf: Dict,
-        shell_type: ShellType
-    ) -> str:
-        """Generate the top-level activation script"""
-        res = ["# This file was generated by 'byoe'"]
-        activated_app_snaps: List[SnapSpec] = []
-        # Load apps
-        for app_name in enable:
-            app_snaps = get_closest_snap(
-                snap_id, self.get_snaps(SnapType.APP, app_name, exists_only=False)
-            )
-            if app_snaps is None:
-                log.warning("No snaps available for app: %s", app_name)
-                continue
-            if any(not s.snap_path.exists() for s in app_snaps):
-                log.warning("Skipping deleted snap: %s", app_snaps[0])
-                continue
-            activated_app_snaps.extend(app_snaps)
-            res.append(f"\n# BYOE: Setup for '{app_name}' app")
-            for app_snap in app_snaps:
-                res.append(app_snap.get_activate_path(shell_type).read_text())
-            extra_act = snap_conf["apps"][app_name].get("extra_activation")
-            if extra_act:
-                res.append(f"# BYOE: Extra activation for '{app_name}' app")
-                res.append("\n".join(extra_act))
-        # Load the environment
-        if env_snaps:
-            for snap in env_snaps:
-                res.append(
-                    f"\n# BYOE: Setup for '{snap.env_type}' layer of '{env_name}' environment"
-                )
-                if snap.env_type == EnvType.PYTHON:
-                    res.append("VIRTUAL_ENV_DISABLE_PROMPT=1")
-                res.append(snap.get_activate_path(shell_type).read_text())
-                if snap.env_type == EnvType.SPACK:
-                    # TODO: this is hacky
-                    res.append("unset PYTHONPATH")
-            extra_act = snap_conf["envs"][env_name].get("extra_activation")
-            if extra_act:
-                res.append(f"# BYOE: Extra activation for '{env_name}' env")
-                res.append("\n".join(extra_act))
-        # Add our own environment modifications
-        res.append("\n# BYOE: Custom setup for BYOE itself")
-        res.append(f"export BYOE_SNAP_ID={snap_id}")
-        apps_path = os.pathsep.join(str(s) for s in activated_app_snaps)
-        res.append(f"export BYOE_APPS={apps_path}")
-        if env_snaps:
-            envs_path = os.pathsep.join(str(s) for s in env_snaps)
-            res.append(f"export BYOE_ENVS={envs_path}")
-            snap_name = env_snaps[0].snap_name
-        else:
-            snap_name = str(snap_id)
-        res.append(PS1_ACT_TEMPLATE.format(snap_name=snap_name))
-        return "\n".join(res)
+    # TODO: Finish this
+    def get_lock_data(
+        self, env_snaps: Iterable[SnapSpec], app_snaps: Iterable[SnapSpec]
+    ) -> Dict[str, Any]:
+        """Get combined lock data for a workspace"""
+        res = {"env": [], "apps": {}}
+        # TODO
+        #for env_snap in env_snaps:
+            #if env_snap.name in self._site_conf.envs:
+                #layer_data = {"conf": }
 
     def get_activate_script(
         self,
@@ -882,4 +899,64 @@ class ByoeRepo:
             else:
                 return (snap_id, reserve_path)
         raise ValueError("Unable to allocate unique SnapId")
-        
+
+    def _make_act_script(
+        self,
+        snap_id: SnapId,
+        env_name: str,
+        env_snaps: Tuple[SnapSpec, ...],
+        enable: List[str],
+        snap_conf: Dict,
+        shell_type: ShellType
+    ) -> str:
+        """Generate the top-level activation script"""
+        res = ["# This file was generated by 'byoe'"]
+        activated_app_snaps: List[SnapSpec] = []
+        # Load apps
+        for app_name in enable:
+            app_snaps = get_closest_snap(
+                snap_id, self.get_snaps(SnapType.APP, app_name, exists_only=False)
+            )
+            if app_snaps is None:
+                log.warning("No snaps available for app: %s", app_name)
+                continue
+            if any(not s.snap_path.exists() for s in app_snaps):
+                log.warning("Skipping deleted snap: %s", app_snaps[0])
+                continue
+            activated_app_snaps.extend(app_snaps)
+            res.append(f"\n# BYOE: Setup for '{app_name}' app")
+            for app_snap in app_snaps:
+                res.append(app_snap.get_activate_path(shell_type).read_text())
+            extra_act = snap_conf["apps"][app_name].get("extra_activation")
+            if extra_act:
+                res.append(f"# BYOE: Extra activation for '{app_name}' app")
+                res.append("\n".join(extra_act))
+        # Load the environment
+        if env_snaps:
+            for snap in env_snaps:
+                res.append(
+                    f"\n# BYOE: Setup for '{snap.env_type}' layer of '{env_name}' environment"
+                )
+                if snap.env_type == EnvType.PYTHON:
+                    res.append("VIRTUAL_ENV_DISABLE_PROMPT=1")
+                res.append(snap.get_activate_path(shell_type).read_text())
+                if snap.env_type == EnvType.SPACK:
+                    # TODO: this is hacky
+                    res.append("unset PYTHONPATH")
+            extra_act = snap_conf["envs"][env_name].get("extra_activation")
+            if extra_act:
+                res.append(f"# BYOE: Extra activation for '{env_name}' env")
+                res.append("\n".join(extra_act))
+        # Add our own environment modifications
+        res.append("\n# BYOE: Custom setup for BYOE itself")
+        res.append(f"export BYOE_SNAP_ID={snap_id}")
+        apps_path = os.pathsep.join(str(s) for s in activated_app_snaps)
+        res.append(f"export BYOE_APPS={apps_path}")
+        if env_snaps:
+            envs_path = os.pathsep.join(str(s) for s in env_snaps)
+            res.append(f"export BYOE_ENVS={envs_path}")
+            snap_name = env_snaps[0].snap_name
+        else:
+            snap_name = str(snap_id)
+        res.append(PS1_ACT_TEMPLATE.format(snap_name=snap_name))
+        return "\n".join(res)

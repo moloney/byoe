@@ -160,8 +160,6 @@ class UserConfig(Config):
 
     default_env: str = "main"
 
-    default_gpu_env: Optional[str] = None
-
     @classmethod
     def build_interactive(cls):
         defaults = cls.get_defaults()
@@ -258,25 +256,12 @@ class IncludableConfig(Config):
         return _dc_from_conf(cls, conf_data)
 
 
-@dataclass
-class SpackBuildChain(Config):
-    """Spack build-chain specification"""
-
-    compiler: Optional[str] = None
-
-    binutils: Optional[str] = None
-
-    target: Optional[str] = None
-
-
 _SPACK_MERGE_STR_SET = frozenset(("variants", "require"))
 
 
 @dataclass
 class SpackConfig(IncludableConfig):
     """Spack specific configuration for an environment"""
-
-    build_chains: Optional[List[SpackBuildChain]] = None
 
     externals: Optional[List[str]] = None
 
@@ -290,9 +275,7 @@ class SpackConfig(IncludableConfig):
             val = getattr(self, field.name)
             if val is None:
                 continue
-            if field.name == "build_chains":
-                res[field.name] = [v.to_dict() for v in val]
-            elif hasattr(val, "to_dict"):
+            if hasattr(val, "to_dict"):
                 res[field.name] = val.to_dict()
             else:
                 res[field.name] = val
@@ -308,23 +291,16 @@ class SpackConfig(IncludableConfig):
     @classmethod
     def from_dict(cls, conf_data: Dict[str, Any]):
         conf_data = cls.resolve_includes(conf_data)
-        build_chains = conf_data.get("build_chains")
-        if build_chains:
-            conf_data["build_chains"] = [
-                SpackBuildChain.from_dict(x) for x in build_chains
-            ]
         res = cls(**conf_data)
         res._explicitly_set = set(conf_data.keys())
         return res
 
-    def set_defaults(self, defaults: Dict[str, Any]) -> None:
-        build_chains = defaults.get("build_chains")
-        if build_chains:
-            defaults = deepcopy(defaults)
-            defaults["build_chains"] = [
-                SpackBuildChain.from_dict(x) for x in build_chains
-            ]
-        super().set_defaults(defaults)
+    def to_spack_conf(self) -> Dict:
+        """Create spack config data, suitable for writing to a spack.yaml file"""
+        res = deepcopy(self.config) if self.config else {}
+        if self.specs:
+            res["specs"] = self.specs[:]
+        return res
 
 
 @dataclass
@@ -345,9 +321,9 @@ class CondaConfig(IncludableConfig):
 
     channels: List[str] = field(default_factory=list)
 
-    specs: List[str] = field(default_factory=list)
-
     virtual: Dict[str, str] = field(default_factory=dict)
+
+    specs: List[str] = field(default_factory=list)
 
     @classmethod
     def filt_include(cls, include_data):
@@ -398,18 +374,25 @@ class EnvConfig(IncludableConfig):
 
 
 @dataclass
-class CondaAppConfig(IncludableConfig):
-    """Config for isolated Conda app"""
-
-    conda: CondaConfig
-
-    exported: Optional[Dict[str, Dict[str, str]]] = None
-
+class _AppConfig(IncludableConfig):
+    """Abstract base class for any application configurations"""
     default: bool = True
 
     extra_activation: Optional[List[str]] = None
 
-    exec_prelude: Optional[Dict[str, List[str]]] = None
+
+@dataclass
+class _CondaAppMixin:
+    conda: CondaConfig
+
+    exported: Optional[Dict[str, Dict[str, str]]] = None
+
+    exec_prelude: Optional[Dict[str, List[str]]] = None 
+
+
+@dataclass
+class CondaAppConfig(_AppConfig, _CondaAppMixin):
+    """Config for isolated Conda app"""
 
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         if "conda" in defaults:
@@ -417,18 +400,17 @@ class CondaAppConfig(IncludableConfig):
 
 
 @dataclass
-class PythonAppConfig(IncludableConfig):
-    """Config for isolated Python app"""
-
+class _PythonAppMixin:
     python: PythonConfig
 
     python_spec: Optional[str] = None
 
     spack: Optional[SpackConfig] = None
 
-    default: bool = True
 
-    extra_activation: Optional[List[str]] = None
+@dataclass
+class PythonAppConfig(_AppConfig, _PythonAppMixin):
+    """Config for isolated Python app"""
 
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         for attr in ("spack", "python"):
@@ -437,20 +419,20 @@ class PythonAppConfig(IncludableConfig):
 
 
 @dataclass
-class ApptainerAppConfig(IncludableConfig):
+class _ApptainerAppMixin:
     """Config for an isolated Apptainer app"""
     apptainer: ApptainerConfig
     
     exported: Optional[List[str]] = None
 
-    default: bool = True
 
-    extra_activation: Optional[List[str]] = None
-
+@dataclass
+class ApptainerAppConfig(_AppConfig, _ApptainerAppMixin):
+    """Config for an isolated Apptainer app"""
+   
     def set_defaults(self, defaults: Dict[str, Dict[str, Any]]) -> None:
         if "apptainer" in defaults:
             self.apptainer.set_defaults(defaults["apptainer"])
-
 
 
 def get_app_conf(conf_data: Dict) -> Union[CondaAppConfig, PythonAppConfig, ApptainerAppConfig]:
@@ -557,6 +539,46 @@ def get_job_build_info(build_config: Optional[BuildConfig], job_type: str):
     }
 
 
+
+
+def _mk_def_tc_conf():
+    return SpackConfig(
+        config = {
+            "packages" : {"gcc": {"require": "+binutils"}, "binutils": {"require": "+gas"}}
+        }
+    )
+
+
+@dataclass
+class SpackToolchainConfig(Config):
+    """Configure spack build toolchain that is itself built with Spack
+    
+    Attributes
+    ----------
+    components : The spack configuration data for the toolchain
+
+    spack : Spack config to use when building the toolchain
+    """
+    components: List[Dict[str, str]]
+
+    spack: SpackConfig = field(default_factory=_mk_def_tc_conf)
+
+    def get_internal_packages(self) -> List[str]:
+        """Get list of non-external packages referenced by this toolchain"""
+        externals = set()
+        if self.spack.externals:
+            externals = set(x for x in self.spack.externals)
+        pkg_specs = []
+        for comp in self.components:
+            req_toks = comp.get("spec", "").split("=")
+            if len(req_toks) < 2:
+                continue
+            spec = "=".join(req_toks[1:])
+            if spec not in externals and spec not in pkg_specs:
+                pkg_specs.append(spec)
+        return pkg_specs
+
+
 @dataclass
 class GlobalSpackConfig(Config):
     """Spack config that is handled globally
@@ -568,9 +590,54 @@ class GlobalSpackConfig(Config):
 
     repo_branch: str = "develop"
 
-    buildcache_padding: int = 128
+    pkg_repo_url: str = "https://github.com/spack/spack-packages.git"
+
+    pkg_repo_branch: str = "develop"
+
+    toolchains: Dict[str, SpackToolchainConfig] = field(default_factory=dict)
+
+    arch: Optional[str] = None
 
     mirrors: Optional[Dict[str, Dict[str, Any]]] = None
+
+    buildcache_padding: int = 128
+
+    connect_timeout: int = 60
+
+    @classmethod
+    def from_dict(cls, conf_data: Dict[str, Any]):
+        conf_data["toolchains"] = {
+            n: SpackToolchainConfig.from_dict(tc) 
+            for n, tc in conf_data["toolchains"].items()
+        } 
+        res = cls(**conf_data)
+        res._explicitly_set = set(conf_data.keys())
+        return res
+
+    def get_spack_conf_data(self, conf_type: str) -> Optional[Dict]:
+        if conf_type == "toolchains":
+            if not self.toolchains:
+                return None
+            return {name: tc.components for name, tc in self.toolchains.items()}
+        elif conf_type == "config":
+            return {
+                "connect_timeout": self.connect_timeout,
+                "install_tree": {"padded_length": self.buildcache_padding},
+            }
+        elif conf_type == "packages":
+            data = None
+            if self.arch:
+                data = {"all" : {"require": f"target={self.arch}"}}
+            return data
+    
+    def write_global_spack_conf(self, conf_dir: Path):
+        for conf_type in ("toolchains", "config", "packages"):
+            conf_data = self.get_spack_conf_data(conf_type)
+            if conf_data is None:
+                continue
+            conf_path = conf_dir / f"{conf_type}.yaml"
+            conf_path.write_text(yaml.safe_dump({conf_type: conf_data}))
+
 
 
 @dataclass
@@ -584,13 +651,6 @@ class GlobalCondaConfig(Config):
 
     source: str = "https://micro.mamba.pm/api/micromamba"
 
-    build_chain: Optional[SpackBuildChain] = None
-
-    def __post_init__(self):
-        if self.source != "spack" and self.build_chain is not None:
-            raise InvalidConfigError(
-                "Specifying 'build_chain' only valid if 'source' is 'spack'"
-            )
 
 
 @dataclass
@@ -610,8 +670,7 @@ class GlobalApptainerConfig(Config):
 @dataclass
 class WorkSpace(Config):
     """Explicitly define a named workspace"""
-    name: str
-
+    
     env: Optional[str] = None
 
     exclude_apps: List[str] = field(default_factory=list)
@@ -638,22 +697,23 @@ class SiteConfig(Config):
 
     defaults: Optional[Dict[str, Dict[str, Any]]] = None
 
-    apps: Optional[Dict[str, Union[CondaAppConfig, PythonAppConfig, ApptainerAppConfig]]] = None
+    apps: Dict[str, Union[CondaAppConfig, PythonAppConfig, ApptainerAppConfig]] = field(default_factory=dict)
 
-    envs: Optional[Dict[str, EnvConfig]] = None
+    envs: Dict[str, EnvConfig] = field(default_factory=dict)
 
-    workspaces: Optional[Dict[str, WorkSpace]] = None
+    workspaces: Dict[str, WorkSpace] = field(default_factory=dict)
 
     def __post_init__(self):
-        app_names = set() if self.apps is None else set(self.apps.keys())
-        env_names = set() if self.envs is None else set(self.envs.keys())
-        for name in app_names | env_names:
+        app_names = set(self.apps.keys())
+        env_names = set(self.envs.keys())
+        ws_names = set(self.workspaces.keys())
+        for name in app_names | env_names | ws_names:
             if not re.match(VALID_ENV_APP_NAME, name):
-                raise InvalidConfigError(f"Invalid env/app name: {name}")
-        collisions = app_names & env_names
+                raise InvalidConfigError(f"Invalid env/app/workspace name: {name}")
+        collisions = app_names & env_names & ws_names
         if collisions:
             raise InvalidConfigError(
-                f"Environments and apps can't share names: {','.join(collisions)}"
+                f"Environments, apps, and workspaces can't share names: {','.join(collisions)}"
             )
 
     def to_dict(self):
@@ -678,6 +738,9 @@ class SiteConfig(Config):
         conda_global = conf_data.get("conda_global")
         if conda_global:
             conf_data["conda_global"] = GlobalCondaConfig.from_dict(conda_global)
+        apptainer_global = conf_data.get("apptainer_global")
+        if apptainer_global:
+            conf_data["apptainer_global"] = GlobalApptainerConfig.from_dict(apptainer_global)
         build_opts = conf_data.get("build_opts")
         if build_opts:
             conf_data["build_opts"] = BuildConfig.from_dict(build_opts)
@@ -689,7 +752,11 @@ class SiteConfig(Config):
             conf_data["envs"] = {
                 name: EnvConfig.from_dict(env_conf) for name, env_conf in envs.items()
             }
-        # TODO: Handle workspaces
+        workspaces = conf_data.get("workspaces")
+        if workspaces:
+            conf_data["workspaces"] = {
+                name: WorkSpace.from_dict(ws_conf) for name, ws_conf in workspaces.items()
+            }
         res = cls(**conf_data)
         res._explicitly_set = set(conf_data.keys())
         return res
@@ -704,7 +771,15 @@ class SiteConfig(Config):
         spack_branch = click.prompt(
             "Enter the git branch to use for spack", default="develop", type=str
         )
-        return cls(GlobalSpackConfig(spack_repo, spack_branch))
+        pkg_repo = click.prompt(
+            "Enter the git repo URL for spack-packages",
+            default="https://github.com/spack/spack-packages.git",
+            type=str,
+        )
+        pkg_branch = click.prompt(
+            "Enter the git branch to use for spack-packages", default="develop", type=str
+        )
+        return cls(GlobalSpackConfig(spack_repo, spack_branch, pkg_repo, pkg_branch))
 
 
 def get_site_conf(

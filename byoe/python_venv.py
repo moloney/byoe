@@ -23,7 +23,7 @@ def get_venv_cmds(
 ) -> List[sh.Command]:
     """Get commands inside a python venv"""
     env_bin = py_venv / "bin"
-    return [get_cmd(env_bin / cmd, log_file=log_file, ref_cmd=python) for cmd in cmds]
+    return [get_cmd(env_bin / cmd, out_handler=log_file, err_handler=log_file, ref_cmd=python) for cmd in cmds]
 
 
 def update_python_env(
